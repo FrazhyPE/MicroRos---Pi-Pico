@@ -58,26 +58,45 @@ size_t wiz_uros_udp_read(struct uxrCustomTransport* transport,
 {
     (void)transport;
 
-    if (g_sock < 0) { *err = 1; return 0; }
+    if (g_sock < 0) { if (err) *err = 1; return 0; }
 
-    absolute_time_t t_end = make_timeout_time_ms(timeout);
+    uint8_t rip[4];
+    uint16_t rport;
+
+    // timeout viene en ms; si es negativo, trátalo como "espera un poco"
+    int to_ms = timeout;
+    if (to_ms < 0) to_ms = 10;
+
+    // si timeout == 0: polling no-bloqueante (una sola vez)
+    if (to_ms == 0) {
+        if (getSn_RX_RSR(g_sock) == 0) { if (err) *err = 0; return 0; }
+        int32_t r = recvfrom(g_sock, buf, (uint16_t)len, rip, &rport);
+        if (r > 0) { if (err) *err = 0; return (size_t)r; }
+        if (err) *err = 0;
+        return 0;
+    }
+
+    absolute_time_t t_end = make_timeout_time_ms(to_ms);
 
     while (absolute_time_diff_us(get_absolute_time(), t_end) > 0) {
 
-        if (getSn_RX_RSR(g_sock) > 0) {
-            uint8_t rip[4];
-            uint16_t rport;
+        // 👇 clave: evita bloqueo
+        if (getSn_RX_RSR(g_sock) == 0) {
+            sleep_ms(1);
+            continue;
+        }
 
-            int32_t r = recvfrom(g_sock, buf, (uint16_t)len, rip, &rport);
-            if (r > 0) {
-                *err = 0;
-                return (size_t)r;
-            }
+        int32_t r = recvfrom(g_sock, buf, (uint16_t)len, rip, &rport);
+        if (r > 0) {
+            if (err) *err = 0;
+            return (size_t)r;
         }
 
         sleep_ms(1);
     }
 
-    *err = 0;  
+    if (err) *err = 0;
     return 0;
 }
+
+

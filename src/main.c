@@ -1,16 +1,106 @@
 #include <stdio.h>
+#include <unistd.h>
 
 #include <rcl/rcl.h>
+#include <rcl/error_handling.h>
 #include <rclc/rclc.h>
-#include <rmw_microros/rmw_microros.h>
-#include <std_msgs/msg/int32.h>
+#include <rclc/executor.h>
 
-#include "pico/stdlib.h"
+#include <rmw_microros/rmw_microros.h>
 
 #include "wizchip_conf.h"
 #include "wizchip_spi.h"
-
 #include "wiz_udp_transport.h"
+
+#include "hardware/watchdog.h"
+#include "pico/stdlib.h"
+
+#include <std_msgs/msg/char.h>
+#include <std_msgs/msg/bool.h>
+#include <std_msgs/msg/u_int8.h>
+
+#include "hardware/uart.h"
+#include "pico/multicore.h"
+#include "pico/util/queue.h"
+
+#define RCABORT(fn) do {rcl_ret_t rc = fn; if(rc != RCL_RET_OK){ printf("Error en la línea %d: %d. Abortando...\n",__LINE__,(int)rc); sleep_ms(1000); watchdog_reboot(0,0,0);}} while (0)
+#define RCCONTINUE(fn) do {rcl_ret_t rc = fn; if(rc != RCL_RET_OK){ printf("Error en la línea %d: %d. Continuando...\n",__LINE__,(int)rc);}} while (0)
+#define COP_PULSE_MS 75
+#define TIMER_GNSS_MS 100
+#define TIMER_IMU_MS 10
+
+/*********************************/
+/*      Declaración de Pines     */
+/*********************************/
+
+const uint COP_LED = 0;
+const uint COP_PATHERN = 5;
+const uint LIGHT = 14;
+const uint CAM = 15;
+
+static queue_t q_gnss;
+static queue_t q_imu;
+static queue_t q_servo;
+
+uint8_t imu_old;
+uint8_t gnss_old;
+uint8_t imu_latest;
+uint8_t gnss_latest;
+uint8_t servo_old;
+uint8_t servo_latest;
+
+/*********************************/
+/*    Estructuras Micro - ROS    */
+/*********************************/
+
+// Nodo
+static rcl_node_t node;
+
+// Agente ROS
+static absolute_time_t next_ping;
+static uint8_t ping_fail = 0;
+
+// GNSS
+static rcl_publisher_t pub_gnss;
+static std_msgs__msg__UInt8 gnss_msg;
+
+// IMU
+static rcl_publisher_t pub_imu;
+static std_msgs__msg__UInt8 imu_msg;
+
+// Led COP
+static rcl_subscription_t sub_COP;
+static rcl_publisher_t pub_COP;
+
+static std_msgs__msg__UInt8 COP_req_msg;
+static std_msgs__msg__Bool COP_resp_msg;
+
+static volatile alarm_id_t cop_pattern_alarm = -1;
+
+// Led Light
+static rcl_subscription_t sub_LIGHT;
+static rcl_publisher_t pub_LIGHT;
+
+static std_msgs__msg__Bool LIGHT_req_msg;
+static std_msgs__msg__Bool LIGHT_resp_msg;
+
+// led CAM
+static rcl_subscription_t sub_CAM;
+static rcl_publisher_t pub_CAM;
+
+static std_msgs__msg__Bool CAM_req_msg;
+static std_msgs__msg__Bool CAM_resp_msg;
+
+// Servo
+static rcl_subscription_t sub_SERVO;
+static rcl_publisher_t pub_SERVO;
+
+static std_msgs__msg__UInt8 SERVO_req_msg;
+static std_msgs__msg__Bool SERVO_resp_msg;
+
+/*********************************/
+/*         Conexión UDP          */
+/*********************************/
 
 static wiz_NetInfo netinfo = {
     .mac = {0x00, 0x08, 0xDC, 0x12, 0x34, 0x56},
@@ -22,7 +112,7 @@ static wiz_NetInfo netinfo = {
 };
 
 static wiz_uros_udp_params_t uros_params = {
-    .agent_ip   = {192, 168, 123, 222},
+    .agent_ip   = {192, 168, 123, 222}, //18
     .agent_port = 8888,
     .local_port = 9999
 };
@@ -30,6 +120,7 @@ static wiz_uros_udp_params_t uros_params = {
 static void wiznet_init(void)
 {
     wizchip_spi_initialize();
+
     wizchip_cris_initialize();
 
     wizchip_initialize();
@@ -39,48 +130,345 @@ static void wiznet_init(void)
     sleep_ms(200);
 }
 
+/*********************************/
+/*     Inicialización Pines      */
+/*********************************/
+
+void gpio_init_custom(void)
+{
+    gpio_init(COP_LED);
+    gpio_set_dir(COP_LED, GPIO_OUT);
+    gpio_put(COP_LED, 0);
+
+    gpio_init(COP_PATHERN);
+    gpio_set_dir(COP_PATHERN, GPIO_OUT);
+    gpio_put(COP_PATHERN, 0);
+
+    gpio_init(LIGHT);
+    gpio_set_dir(LIGHT, GPIO_OUT);
+    gpio_put(LIGHT, 0);
+
+    gpio_init(CAM);
+    gpio_set_dir(CAM, GPIO_OUT);
+    gpio_put(CAM, 0);
+}
+
+/*********************************/
+/*    Callbacks Timer y Subs     */
+/*********************************/
+
+// Extracción y Liberación de la Cola : Lectura
+static inline bool queue_try_get_latest(queue_t *q, void *out)
+{
+    bool has = false;
+    while (queue_try_remove(q, out)) {
+        has = true;
+    }
+    return has;
+}
+
+// Envio y Limpieza de la cola : Envio
+static inline void queue_push_latest(queue_t *q, const void *elem, void *scratch_old)
+{
+    if (!queue_try_add(q, elem)) {
+        (void)queue_try_remove(q, scratch_old);
+        (void)queue_try_add(q, elem);
+    }
+}
+
+// Callback Led COP
+static int64_t cop_pattern_off_cb(alarm_id_t id, void *user_data)
+{
+    (void)id; (void)user_data;
+    gpio_put(COP_PATHERN, 0);
+    cop_pattern_alarm = -1;
+    return 0;
+}
+
+static inline void cop_trigger_pattern_pulse(uint32_t ms)
+{
+    if (cop_pattern_alarm >= 0) {
+        cancel_alarm(cop_pattern_alarm);
+        cop_pattern_alarm = -1;
+    }
+
+    gpio_put(COP_PATHERN, 1);
+    cop_pattern_alarm = add_alarm_in_ms((int32_t)ms, cop_pattern_off_cb, NULL, true);
+}
+
+void subscription_callback_cop(const void * msgin)
+{
+    const std_msgs__msg__UInt8 * msg = (const std_msgs__msg__UInt8 *)msgin;
+    bool ok = true;
+
+    switch (msg->data) {
+        case 0:
+            gpio_put(COP_LED, 0);
+            break;
+
+        case 1: 
+            gpio_put(COP_LED, 1);
+            break;
+
+        case 2:
+            if (gpio_get(COP_LED)) {
+                cop_trigger_pattern_pulse(COP_PULSE_MS);
+            } else {
+                ok = false;
+            }
+            break;
+
+        default:
+            ok = false;
+            break;
+    }
+
+    COP_resp_msg.data = ok;
+    RCCONTINUE(rcl_publish(&pub_COP, &COP_resp_msg, NULL));
+}
+
+// Callback Light
+void subscription_callback_light(const void * msgin)
+{
+  const std_msgs__msg__Bool * msg = (const std_msgs__msg__Bool *)msgin;
+  
+  LIGHT_resp_msg.data = false;
+
+  if (msg->data) {
+    gpio_put(LIGHT, 1);
+    LIGHT_resp_msg.data = true;
+  } else {
+    gpio_put(LIGHT, 0);
+    LIGHT_resp_msg.data = true;
+  }
+  RCCONTINUE(rcl_publish(&pub_LIGHT, &LIGHT_resp_msg, NULL));
+}
+
+// Callback CAM
+void subscription_callback_cam(const void * msgin)
+{
+  const std_msgs__msg__Bool * msg = (const std_msgs__msg__Bool *)msgin;
+  
+  CAM_resp_msg.data = false;
+
+  if (msg->data) {
+    gpio_put(CAM, 1);
+    CAM_resp_msg.data = true;
+  } else {
+    gpio_put(CAM, 0);
+    CAM_resp_msg.data = true;
+  }
+  RCCONTINUE(rcl_publish(&pub_CAM, &CAM_resp_msg, NULL));
+}
+
+//Callback Servo
+void subscription_callback_servo(const void * msgin)
+{
+  const std_msgs__msg__UInt8 * msg = (const std_msgs__msg__UInt8 *)msgin;
+  
+  SERVO_resp_msg.data = false;
+  uint8_t a = msg->data;
+
+  if (a <= 180) {
+    queue_push_latest(&q_servo, &a, &servo_old);
+    SERVO_resp_msg.data = true;
+  }
+
+  RCCONTINUE(rcl_publish(&pub_SERVO, &SERVO_resp_msg, NULL));
+}
+
+/*********************************/
+/*       Función Secundaria      */
+/*********************************/
+
+void core1_entry(void)
+{
+    uint8_t gnss = 0;
+    uint8_t imu  = 0;
+
+    absolute_time_t next_gnss = get_absolute_time();
+    absolute_time_t next_imu  = get_absolute_time();
+
+    const int gnss_period_us = TIMER_GNSS_MS * 1000;
+    const int imu_period_us  = TIMER_IMU_MS  * 1000;
+
+    while (true)
+    {
+        absolute_time_t now = get_absolute_time();
+
+        if (absolute_time_diff_us(now, next_imu) <= 0) {
+            next_imu = delayed_by_us(next_imu, imu_period_us);
+            imu++;
+            queue_push_latest(&q_imu, &imu, &imu_old);
+        }
+
+        if (absolute_time_diff_us(now, next_gnss) <= 0) {
+            next_gnss = delayed_by_us(next_gnss, gnss_period_us);
+            gnss++;
+            queue_push_latest(&q_gnss, &gnss, &gnss_old);
+        }
+
+        if (queue_try_get_latest(&q_servo, &servo_latest)) {
+            uint8_t current_angle = servo_latest;
+
+            printf("Angulo servo %d\n",current_angle);
+        }
+
+        tight_loop_contents();
+    }
+}
+
+/*********************************/
+/*       Función Principal       */
+/*********************************/
 
 int main(void)
 {
+    // Inicialización de la placa y conexión de red
     stdio_init_all();
     sleep_ms(1500);
-
     wiznet_init();
-
     rmw_uros_set_custom_transport(
-        false,               // UDP => false
+        false,
         &uros_params,
         wiz_uros_udp_open,
         wiz_uros_udp_close,
         wiz_uros_udp_write,
         wiz_uros_udp_read
     );
-
     while (rmw_uros_ping_agent(1000, 1) != RCL_RET_OK) {
         sleep_ms(500);
     }
 
+    // Configuración Pines
+    gpio_init_custom();
+
+    queue_init(&q_imu,  sizeof(uint8_t),  16);
+    queue_init(&q_gnss, sizeof(uint8_t),  8);
+    queue_init(&q_servo, sizeof(uint8_t), 8); 
+
+    multicore_launch_core1(core1_entry);
+
+    // Configuración Nodo
     rcl_allocator_t allocator = rcl_get_default_allocator();
     rclc_support_t support;
-    rcl_node_t node;
-    rcl_publisher_t pub;
-    std_msgs__msg__Int32 msg;
+    RCABORT(rclc_support_init(&support, 0, NULL, &allocator));
+    RCABORT(rclc_node_init_default(&node, "node", "pico", &support));
 
-    rclc_support_init(&support, 0, NULL, &allocator);
-    rclc_node_init_default(&node, "pico_w5500_node", "", &support);
+    // Configuración LED COP
+    const rosidl_message_type_support_t * type_support_sub_cop = ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, UInt8);
+    RCABORT(rclc_subscription_init_default(&sub_COP, &node, type_support_sub_cop, "led_cop/req"));
 
-    rclc_publisher_init_default(
-        &pub,
-        &node,
-        ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int32),
-        "pico_int"
-    );
+    const rosidl_message_type_support_t * type_support_pub_cop = ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Bool);
+    RCABORT(rclc_publisher_init_default(&pub_COP, &node, type_support_pub_cop, "led_cop/resp"));
 
-    msg.data = 0;
+    // Configuración LIGHT
+    const rosidl_message_type_support_t * type_support_sub_light = ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Bool);
+    RCABORT(rclc_subscription_init_default(&sub_LIGHT, &node, type_support_sub_light, "led_light/req"));
 
-    while (true) {
-        msg.data++;
-        (void)rcl_publish(&pub, &msg, NULL);
-        sleep_ms(1000);
+    const rosidl_message_type_support_t * type_support_pub_light = ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Bool);
+    RCABORT(rclc_publisher_init_default(&pub_LIGHT, &node, type_support_pub_light, "led_light/resp"));
+
+    // Configuración CAM
+    const rosidl_message_type_support_t * type_support_sub_cam = ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Bool);
+    RCABORT(rclc_subscription_init_default(&sub_CAM, &node, type_support_sub_cam, "led_cam/req"));
+
+    const rosidl_message_type_support_t * type_support_pub_cam = ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Bool);
+    RCABORT(rclc_publisher_init_default(&pub_CAM, &node, type_support_pub_cam, "led_cam/resp"));
+
+    // Configuración SERVO
+    const rosidl_message_type_support_t * type_support_sub_servo = ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, UInt8);
+    RCABORT(rclc_subscription_init_default(&sub_SERVO, &node, type_support_sub_servo, "led_servo/req"));
+
+    const rosidl_message_type_support_t * type_support_pub_servo = ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Bool);
+    RCABORT(rclc_publisher_init_default(&pub_SERVO, &node, type_support_pub_servo, "led_servo/resp"));
+
+    // Configuración GNSS
+    const rosidl_message_type_support_t * type_support_pub_gnss = ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, UInt8);
+    RCABORT(rclc_publisher_init_default(&pub_gnss, &node, type_support_pub_gnss, "gnss"));
+
+    // Configuración IMU
+    const rosidl_message_type_support_t * type_support_pub_imu = ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, UInt8);
+    RCABORT(rclc_publisher_init_best_effort(&pub_imu, &node, type_support_pub_imu, "imu"));
+
+    // Incialización mensajes
+    std_msgs__msg__UInt8__init(&COP_req_msg);
+    std_msgs__msg__Bool__init(&COP_resp_msg);
+    std_msgs__msg__Bool__init(&LIGHT_req_msg);
+    std_msgs__msg__Bool__init(&LIGHT_resp_msg);
+    std_msgs__msg__Bool__init(&CAM_req_msg);
+    std_msgs__msg__Bool__init(&CAM_resp_msg);
+    std_msgs__msg__UInt8__init(&SERVO_req_msg);
+    std_msgs__msg__Bool__init(&SERVO_resp_msg);
+    std_msgs__msg__UInt8__init(&gnss_msg);
+    std_msgs__msg__UInt8__init(&imu_msg);
+
+    // Configuración Executor
+    rclc_executor_t executor;
+    executor = rclc_executor_get_zero_initialized_executor();
+    unsigned int num_handles = 4;
+    RCABORT(rclc_executor_init(&executor, &support.context, num_handles, &allocator));
+    RCABORT(rclc_executor_add_subscription(&executor, &sub_COP, &COP_req_msg, &subscription_callback_cop, ON_NEW_DATA));
+    RCABORT(rclc_executor_add_subscription(&executor, &sub_LIGHT, &LIGHT_req_msg, &subscription_callback_light, ON_NEW_DATA));
+    RCABORT(rclc_executor_add_subscription(&executor, &sub_CAM, &CAM_req_msg, &subscription_callback_cam, ON_NEW_DATA));
+    RCABORT(rclc_executor_add_subscription(&executor, &sub_SERVO, &SERVO_req_msg, &subscription_callback_servo, ON_NEW_DATA));
+
+    rclc_executor_set_timeout(&executor, RCL_MS_TO_NS(5));
+
+    next_ping = make_timeout_time_ms(1000);
+    ping_fail = 0;
+    
+    while (true)
+    {
+        rclc_executor_spin_some(&executor, RCL_MS_TO_NS(1));
+
+        if (queue_try_get_latest(&q_imu, &imu_latest)) {
+            imu_msg.data = imu_latest;
+            RCCONTINUE(rcl_publish(&pub_imu, &imu_msg, NULL));
+        }
+
+        if (queue_try_get_latest(&q_gnss, &gnss_latest)) {
+            gnss_msg.data = gnss_latest;
+            RCCONTINUE(rcl_publish(&pub_gnss, &gnss_msg, NULL));
+        }
+
+        
+        
+        if (absolute_time_diff_us(get_absolute_time(), next_ping) <= 0)
+        {
+            next_ping = make_timeout_time_ms(1000);
+
+            bool ok = false;
+            for (int i = 0; i < 10; i++) {
+                if (rmw_uros_ping_agent(2, 1) == RCL_RET_OK) { ok = true; break; }
+            }
+
+            if (!ok) {
+                ping_fail++;
+                printf("PING FAIL (%u)\n", ping_fail);
+            } else {
+                ping_fail = 0;
+            }
+
+            if (ping_fail >= 3) {
+                printf("Agent caído -> reboot\n");
+                sleep_ms(20);
+                watchdog_reboot(0, 0, 0);
+            }
+        }
     }
+
+    rclc_executor_fini(&executor);
+    rcl_publisher_fini(&pub_COP, &node);
+    rcl_publisher_fini(&pub_LIGHT, &node);
+    rcl_publisher_fini(&pub_CAM, &node);
+    rcl_publisher_fini(&pub_SERVO, &node);
+    rcl_subscription_fini(&sub_COP, &node);
+    rcl_subscription_fini(&sub_LIGHT, &node);
+    rcl_subscription_fini(&sub_CAM, &node);
+    rcl_subscription_fini(&sub_SERVO, &node);
+    rcl_node_fini(&node);
+    rclc_support_fini(&support);
+
+    return 0;
 }
