@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <unistd.h>
+#include <math.h>
 
 #include <rcl/rcl.h>
 #include <rcl/error_handling.h>
@@ -56,6 +57,16 @@ typedef struct {
     float qy;
     float qz;
     float qw;
+    float yaw_var;
+    bool valid;
+    uint8_t quality;
+} gnss_heading_t;
+
+typedef struct {
+    float qx;
+    float qy;
+    float qz;
+    float qw;
     float gx;
     float gy;
     float gz;
@@ -90,8 +101,8 @@ uint8_t imu_latest;
 gnss_fix_t gnss_old;
 gnss_fix_t gnss_latest;
 
-imu_t gnss_heading_old;
-imu_t gnss_heading_latest;
+gnss_heading_t gnss_heading_old;
+gnss_heading_t gnss_heading_latest;
 
 uint8_t servo_old;
 uint8_t servo_latest;
@@ -118,7 +129,7 @@ static rcl_publisher_t pub_gnss_heading;
 static sensor_msgs__msg__Imu gnss_heading_msg;
 
 static rcl_publisher_t pub_gnss_heading_quality;
-static std_msgs__msg__Float32 gnss_heading_quality_msg;
+static std_msgs__msg__UInt8 gnss_heading_quality_msg;
 
 // IMU
 static rcl_publisher_t pub_imu;
@@ -299,8 +310,102 @@ static bool parse_gga_line(const char *line, gnss_fix_t *out)
     return true;
 }
 
-static bool parse_headingga_line(char *line, *gnss_heading){
+static inline float deg2radf(float deg)
+{
+    return deg * 0.017453292519943295f;
+}
 
+static inline void quat_from_yaw(float yaw_rad, float *qx, float *qy, float *qz, float *qw)
+{
+    float half = 0.5f * yaw_rad;
+    *qx = 0.0f;
+    *qy = 0.0f;
+    *qz = sinf(half);
+    *qw = cosf(half);
+}
+
+static uint8_t heading_quality_from_sol(const char *sol)
+{
+    if (!sol) return 0;
+    if (strcmp(sol, "NARROW_INT") == 0)   return 4; // mejor
+    if (strcmp(sol, "NARROW_FLOAT") == 0) return 3;
+    if (strcmp(sol, "FLOAT") == 0 || strcmp(sol, "L1_FLOAT") == 0 || strcmp(sol, "NARROW_FLOAT") == 0) return 2;
+    if (strcmp(sol, "SINGLE") == 0)       return 1;
+    if (strcmp(sol, "NONE") == 0)         return 0;
+    return 1;
+}
+
+static bool parse_headingga_line(const char *line, gnss_heading_t *out)
+{
+    if (strncmp(line, "#UNIHEADINGA,", 12) != 0 && strncmp(line, "#HEADINGA,", 9) != 0) {
+        return false;
+    }
+
+    const char *semi = strchr(line, ';');
+    if (!semi || !semi[1]) return true;
+
+    char buf[220];
+    strncpy(buf, semi + 1, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = 0;
+
+    char *save = NULL;
+    char *tok = strtok_r(buf, ",", &save);
+
+    // Esperado:
+    // tok0 = SOL_COMPUTED  (o INSUFFICIENT_OBS, etc.)
+    // tok1 = NARROW_FLOAT / NARROW_INT / NONE / ...
+    // tok2 = baseline_m
+    // tok3 = heading_deg
+    // tok4 = pitch_deg
+    // tok5 = reserved (a veces 0.0000)
+    // tok6 = heading_std
+    // tok7 = pitch_std
+    const char *status = NULL;
+    const char *sol = NULL;
+
+    float baseline = 0, heading = 0, pitch = 0, hstd = 0, pstd = 0;
+
+    int field = 0;
+    while (tok) {
+        // tok puede venir con \r al final
+        size_t n = strlen(tok);
+        if (n && tok[n-1] == '\r') tok[n-1] = 0;
+
+        if (field == 0) status = tok;
+        else if (field == 1) sol = tok;
+        else if (field == 2 && tok[0]) baseline = (float)atof(tok);
+        else if (field == 3 && tok[0]) heading  = (float)atof(tok);
+        else if (field == 4 && tok[0]) pitch    = (float)atof(tok);
+        else if (field == 6 && tok[0]) hstd     = (float)atof(tok);
+        else if (field == 7 && tok[0]) pstd     = (float)atof(tok);
+
+        tok = strtok_r(NULL, ",", &save);
+        field++;
+    }
+
+    while (heading < 0.0f) heading += 360.0f;
+    while (heading >= 360.0f) heading -= 360.0f;
+
+    float half = 0.5f * heading * 0.017453292519943295f;
+
+    float yaw_rad = deg2radf(heading);
+    quat_from_yaw(yaw_rad, &out->qx, &out->qy, &out->qz, &out->qw);
+
+    float yaw_std_rad = deg2radf(hstd);
+    out->yaw_var = yaw_std_rad * yaw_std_rad;
+
+    out->valid = true;
+    out->quality = heading_quality_from_sol(sol);
+
+    if (status && (strncmp(status, "INSUFFICIENT_OBS", 16) == 0)) out->valid = false;
+    if (sol && strcmp(sol, "NONE") == 0) out->valid = false;
+
+    if (!out->valid) {
+    out->yaw_var = 99999.0f;
+    out->qx = 0.0f; out->qy = 0.0f; out->qz = 0.0f; out->qw = 1.0f;
+    }
+
+    return true;
 }
 
 static int8_t navsat_status_from_fixq(uint8_t fixq)
@@ -423,6 +528,7 @@ void core1_entry(void)
 {
     uint8_t imu  = 0;
     gnss_fix_t gnss;
+    gnss_heading_t gnss_heading;
     
     absolute_time_t next_imu  = get_absolute_time();
 
@@ -511,8 +617,8 @@ int main(void)
     // Colas Core
     queue_init(&q_imu,  sizeof(uint8_t),  16);
     queue_init(&q_gnss, sizeof(gnss_fix_t),  8);
+    queue_init(&q_gnss_heading, sizeof(gnss_heading_t), 8);
     queue_init(&q_servo, sizeof(uint8_t), 8);
-    queue_init(&q_gnss_heading, sizeof(float), 8);
 
     multicore_launch_core1(core1_entry);
 
@@ -557,11 +663,11 @@ int main(void)
     const rosidl_message_type_support_t * type_support_pub_gnss_quality = ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, UInt8);
     RCABORT(rclc_publisher_init_default(&pub_gnss_quality, &node, type_support_pub_gnss_quality, "gnss/fix_quality"));
 
-    const rosidl_message_type_support_t * type_support_pub_gnss_heading = ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Imu);
+    const rosidl_message_type_support_t * type_support_pub_gnss_heading = ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, Imu);
     RCABORT(rclc_publisher_init_default(&pub_gnss_heading, &node, type_support_pub_gnss_heading, "gnss/heading"));
 
     const rosidl_message_type_support_t * type_support_pub_gnss_heading_quality = ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, UInt8);
-    RCABORT(rclc_publisher_init_default(&pub_gnss_heading, &node, type_support_pub_gnss_heading_quality, "gnss/heading_quality"));
+    RCABORT(rclc_publisher_init_default(&pub_gnss_heading_quality, &node, type_support_pub_gnss_heading_quality, "gnss/heading_quality"));
 
     // Configuración IMU
     const rosidl_message_type_support_t * type_support_pub_imu = ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, UInt8);
@@ -587,12 +693,7 @@ int main(void)
 
     rosidl_runtime_c__String__assign(&gnss_heading_msg.header.frame_id, "gnss_heading");
     gnss_heading_msg.angular_velocity_covariance[0] = -1;
-    gnss_heading_msg.linear_acceleration_covariance[0] = -1;
-    float var = 0.0001f;
-
-    gnss_heading_msg.orientation_covariance[0] = var;
-    gnss_heading_msg.orientation_covariance[4] = var;
-    gnss_heading_msg.orientation_covariance[8] = var;   
+    gnss_heading_msg.linear_acceleration_covariance[0] = -1;  
 
     // Configuración Executor
     rclc_executor_t executor;
@@ -646,7 +747,16 @@ int main(void)
             now_us = time_us_64();
             stamp_from_us(&gnss_heading_msg.header.stamp, now_us);
 
-            gnss_heading_quality_msg.data = ;
+            gnss_heading_msg.orientation.x = gnss_heading_latest.qx;
+            gnss_heading_msg.orientation.y = gnss_heading_latest.qy;
+            gnss_heading_msg.orientation.z = gnss_heading_latest.qz;
+            gnss_heading_msg.orientation.w = gnss_heading_latest.qw;
+
+            gnss_heading_msg.orientation_covariance[0] = 99999.0;
+            gnss_heading_msg.orientation_covariance[4] = 99999.0;
+            gnss_heading_msg.orientation_covariance[8] = gnss_heading_latest.yaw_var;
+            
+            gnss_heading_quality_msg.data = gnss_heading_latest.quality;
 
             RCCONTINUE(rcl_publish(&pub_gnss_heading, &gnss_heading_msg, NULL));
             RCCONTINUE(rcl_publish(&pub_gnss_heading_quality, &gnss_heading_quality_msg, NULL));
