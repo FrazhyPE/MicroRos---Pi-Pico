@@ -19,13 +19,15 @@ set_target_properties(microros PROPERTIES
 )
 
 add_executable(pico_uros_w5500
-  src/main.c
+  src/main.cpp
   src/wiz_udp_transport.c
   src/clock_gettime_stub.c
 )
 
 set(WIZ_IO ${CMAKE_CURRENT_LIST_DIR}/lib/ioLibrary_Driver)
 set(WIZ_PORT ${CMAKE_CURRENT_LIST_DIR}/lib/port)
+set(SC_SERVO ${CMAKE_CURRENT_LIST_DIR}/lib/scservo)
+set(BNO086 ${CMAKE_CURRENT_LIST_DIR}/lib/BNO086)
 
 target_sources(pico_uros_w5500 PRIVATE
   ${WIZ_IO}/Ethernet/wizchip_conf.c
@@ -36,6 +38,17 @@ target_sources(pico_uros_w5500 PRIVATE
   ${WIZ_PORT}/ioLibrary_Driver/src/wizchip_gpio_irq.c
 
   ${WIZ_PORT}/timer/timer.c
+
+  ${SC_SERVO}/SCS.cpp
+  ${SC_SERVO}/SCSCL.cpp
+  ${SC_SERVO}/SCSerial.cpp
+  ${SC_SERVO}/SMS_STS.cpp
+
+  ${BNO086}/src/sh2.c
+  ${BNO086}/src/sh2_util.c
+  ${BNO086}/src/sh2_SensorValue.c
+  ${BNO086}/src/shtp.c
+  ${BNO086}/src/SparkFun_BNO08x_Arduino_Library.cpp
 )
 
 target_include_directories(pico_uros_w5500 PRIVATE
@@ -52,6 +65,8 @@ target_include_directories(pico_uros_w5500 PRIVATE
   ${WIZ_PORT}
   ${WIZ_PORT}/ioLibrary_Driver/inc
   ${WIZ_PORT}/timer
+  ${SC_SERVO} 
+  ${BNO086}/src
 )
 
 add_compile_definitions(_WIZCHIP_=W5500)
@@ -61,8 +76,11 @@ target_link_libraries(pico_uros_w5500
   hardware_spi
   hardware_dma
   hardware_irq
+  hardware_uart
   microros
   pico_multicore
+  hardware_i2c
+  hardware_gpio
 )
 
 pico_enable_stdio_usb(pico_uros_w5500 1)

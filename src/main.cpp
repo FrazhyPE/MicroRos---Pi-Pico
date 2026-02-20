@@ -2,16 +2,23 @@
 #include <unistd.h>
 #include <math.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <rcl/rcl.h>
 #include <rcl/error_handling.h>
 #include <rclc/rclc.h>
 #include <rclc/executor.h>
-
 #include <rmw_microros/rmw_microros.h>
 
 #include "wizchip_conf.h"
 #include "wizchip_spi.h"
 #include "wiz_udp_transport.h"
+
+#ifdef __cplusplus
+}
+#endif
 
 #include "hardware/watchdog.h"
 #include "pico/stdlib.h"
@@ -28,6 +35,7 @@
 #include "hardware/uart.h"
 #include "pico/multicore.h"
 #include "pico/util/queue.h"
+#include <SCServo.h>
 
 #define RCABORT(fn) do {rcl_ret_t rc = fn; if(rc != RCL_RET_OK){ printf("Error en la línea %d: %d. Abortando...\n",__LINE__,(int)rc); sleep_ms(1000); watchdog_reboot(0,0,0);}} while (0)
 #define RCCONTINUE(fn) do {rcl_ret_t rc = fn; if(rc != RCL_RET_OK){ printf("Error en la línea %d: %d. Continuando...\n",__LINE__,(int)rc);}} while (0)
@@ -37,6 +45,15 @@
 #define GNSS_BAUD 115200
 #define GNSS_TX_PIN 8
 #define GNSS_RX_PIN 9
+
+#define SERVO_UART uart0
+#define SERVO_BAUD 1000000
+#define SERVO_TX_PIN 12
+#define SERVO_RX_PIN 13 
+
+#define SERVO_ID 5
+#define SERVO_SPEED 1500
+#define SERVO_ACC 50
 
 /*********************************/
 /*          Estructuras          */
@@ -76,6 +93,8 @@ typedef struct {
     uint8_t calib_status;
     bool valid;
 } imu_t;
+
+SMS_STS st;
 
 /*********************************/
 /*      Declaración de Pines     */
@@ -529,6 +548,7 @@ void core1_entry(void)
     uint8_t imu  = 0;
     gnss_fix_t gnss;
     gnss_heading_t gnss_heading;
+    uint8_t current_angle;
     
     absolute_time_t next_imu  = get_absolute_time();
 
@@ -572,9 +592,10 @@ void core1_entry(void)
         }
 
         if (queue_try_get_latest(&q_servo, &servo_latest)) {
-            uint8_t current_angle = servo_latest;
+            uint8_t angle = servo_latest;
+            uint16_t pos = (uint16_t)(angle*512.0/45.0+1024.0);
 
-            printf("Angulo servo %d\n",current_angle);
+            st.WritePosEx(SERVO_ID, pos, SERVO_SPEED, SERVO_ACC);
         }
 
         tight_loop_contents();
@@ -605,6 +626,15 @@ int main(void)
 
     // Configuración Pines
     gpio_init_custom();
+
+    // Configuración UART para Servo
+    uart_init(SERVO_UART, SERVO_BAUD);
+    gpio_set_function(SERVO_TX_PIN, GPIO_FUNC_UART);
+    gpio_set_function(SERVO_RX_PIN, GPIO_FUNC_UART);
+    uart_set_format(SERVO_UART, 8, 1, UART_PARITY_NONE);
+    uart_set_fifo_enabled(SERVO_UART, true);
+    
+    st.setUart(SERVO_UART); 
 
     // Configuración UART1
 
