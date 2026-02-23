@@ -27,7 +27,11 @@ add_executable(pico_uros_w5500
 set(WIZ_IO ${CMAKE_CURRENT_LIST_DIR}/lib/ioLibrary_Driver)
 set(WIZ_PORT ${CMAKE_CURRENT_LIST_DIR}/lib/port)
 set(SC_SERVO ${CMAKE_CURRENT_LIST_DIR}/lib/scservo)
-set(BNO086 ${CMAKE_CURRENT_LIST_DIR}/lib/BNO086)
+set(BNO086 ${CMAKE_CURRENT_LIST_DIR}/lib/BNO08x_Pico_Library)
+
+add_subdirectory(
+	lib/BNO08x_Pico_Library
+)
 
 target_sources(pico_uros_w5500 PRIVATE
   ${WIZ_IO}/Ethernet/wizchip_conf.c
@@ -43,12 +47,6 @@ target_sources(pico_uros_w5500 PRIVATE
   ${SC_SERVO}/SCSCL.cpp
   ${SC_SERVO}/SCSerial.cpp
   ${SC_SERVO}/SMS_STS.cpp
-
-  ${BNO086}/src/sh2.c
-  ${BNO086}/src/sh2_util.c
-  ${BNO086}/src/sh2_SensorValue.c
-  ${BNO086}/src/shtp.c
-  ${BNO086}/src/SparkFun_BNO08x_Arduino_Library.cpp
 )
 
 target_include_directories(pico_uros_w5500 PRIVATE
@@ -65,8 +63,7 @@ target_include_directories(pico_uros_w5500 PRIVATE
   ${WIZ_PORT}
   ${WIZ_PORT}/ioLibrary_Driver/inc
   ${WIZ_PORT}/timer
-  ${SC_SERVO} 
-  ${BNO086}/src
+  ${SC_SERVO}
 )
 
 add_compile_definitions(_WIZCHIP_=W5500)
@@ -81,6 +78,7 @@ target_link_libraries(pico_uros_w5500
   pico_multicore
   hardware_i2c
   hardware_gpio
+  BNO08x_Pico_Library
 )
 
 pico_enable_stdio_usb(pico_uros_w5500 1)
