@@ -37,6 +37,9 @@ extern "C" {
 #include "pico/util/queue.h"
 #include <SCServo.h>
 
+#include "bno08x.h"
+#include "utils.h"
+
 #define RCABORT(fn) do {rcl_ret_t rc = fn; if(rc != RCL_RET_OK){ printf("Error en la línea %d: %d. Abortando...\n",__LINE__,(int)rc); sleep_ms(1000); watchdog_reboot(0,0,0);}} while (0)
 #define RCCONTINUE(fn) do {rcl_ret_t rc = fn; if(rc != RCL_RET_OK){ printf("Error en la línea %d: %d. Continuando...\n",__LINE__,(int)rc);}} while (0)
 #define COP_PULSE_MS 75
@@ -114,8 +117,8 @@ static queue_t q_gnss_heading;
 static queue_t q_imu;
 static queue_t q_servo;
 
-uint8_t imu_old;
-uint8_t imu_latest;
+imu_t imu_old;
+imu_t imu_latest;
 
 gnss_fix_t gnss_old;
 gnss_fix_t gnss_latest;
@@ -125,6 +128,11 @@ gnss_heading_t gnss_heading_latest;
 
 uint8_t servo_old;
 uint8_t servo_latest;
+
+extern int8_t _reset_pin;
+extern int8_t _int_pin;
+
+static BNO08x IMU;
 
 /*********************************/
 /*    Estructuras Micro - ROS    */
@@ -152,7 +160,8 @@ static std_msgs__msg__UInt8 gnss_heading_quality_msg;
 
 // IMU
 static rcl_publisher_t pub_imu;
-static std_msgs__msg__UInt8 imu_msg;
+static sensor_msgs__msg__Imu imu_msg;
+
 
 // Led COP
 static rcl_subscription_t sub_COP;
@@ -244,10 +253,10 @@ void gpio_init_custom(void)
 /*********************************/
 
 // Extracción y Liberación de la Cola : Lectura
-static inline bool queue_try_get_latest(queue_t *q, void *out)
+static inline bool queue_try_get_latest(queue_t *q, void *imu)
 {
     bool has = false;
-    while (queue_try_remove(q, out)) {
+    while (queue_try_remove(q, imu)) {
         has = true;
     }
     return has;
@@ -277,7 +286,7 @@ static inline double nmea_degmin_to_deg(double degmin)
     return (double)deg + minutes / 60.0;
 }
 
-static bool parse_gga_line(const char *line, gnss_fix_t *out)
+static bool parse_gga_line(const char *line, gnss_fix_t *imu)
 {
     // $GNGGA,time,lat,N/S,lon,E/W,fix,sats,hdop,alt,M,...
     if (strncmp(line, "$GNGGA,", 7) != 0 && strncmp(line, "$GPGGA,", 7) != 0) return false;
@@ -308,13 +317,13 @@ static bool parse_gga_line(const char *line, gnss_fix_t *out)
         field++;
     }
 
-    out->fix_q = (uint8_t)fix;
-    out->sats  = (uint8_t)sats;
-    out->hdop  = (float)hdop;
-    out->alt_m = alt;
+    imu->fix_q = (uint8_t)fix;
+    imu->sats  = (uint8_t)sats;
+    imu->hdop  = (float)hdop;
+    imu->alt_m = alt;
 
     if (fix <= 0 || lat_dm == 0 || lon_dm == 0 || ns == 0 || ew == 0) {
-        out->valid = false;
+        imu->valid = false;
         return true;
     }
 
@@ -323,9 +332,9 @@ static bool parse_gga_line(const char *line, gnss_fix_t *out)
     if (ns == 'S') lat = -lat;
     if (ew == 'W') lon = -lon;
 
-    out->lat_deg = lat;
-    out->lon_deg = lon;
-    out->valid = true;
+    imu->lat_deg = lat;
+    imu->lon_deg = lon;
+    imu->valid = true;
     return true;
 }
 
@@ -354,7 +363,7 @@ static uint8_t heading_quality_from_sol(const char *sol)
     return 1;
 }
 
-static bool parse_headingga_line(const char *line, gnss_heading_t *out)
+static bool parse_headingga_line(const char *line, gnss_heading_t *imu)
 {
     if (strncmp(line, "#UNIHEADINGA,", 12) != 0 && strncmp(line, "#HEADINGA,", 9) != 0) {
         return false;
@@ -408,20 +417,20 @@ static bool parse_headingga_line(const char *line, gnss_heading_t *out)
     float half = 0.5f * heading * 0.017453292519943295f;
 
     float yaw_rad = deg2radf(heading);
-    quat_from_yaw(yaw_rad, &out->qx, &out->qy, &out->qz, &out->qw);
+    quat_from_yaw(yaw_rad, &imu->qx, &imu->qy, &imu->qz, &imu->qw);
 
     float yaw_std_rad = deg2radf(hstd);
-    out->yaw_var = yaw_std_rad * yaw_std_rad;
+    imu->yaw_var = yaw_std_rad * yaw_std_rad;
 
-    out->valid = true;
-    out->quality = heading_quality_from_sol(sol);
+    imu->valid = true;
+    imu->quality = heading_quality_from_sol(sol);
 
-    if (status && (strncmp(status, "INSUFFICIENT_OBS", 16) == 0)) out->valid = false;
-    if (sol && strcmp(sol, "NONE") == 0) out->valid = false;
+    if (status && (strncmp(status, "INSUFFICIENT_OBS", 16) == 0)) imu->valid = false;
+    if (sol && strcmp(sol, "NONE") == 0) imu->valid = false;
 
-    if (!out->valid) {
-    out->yaw_var = 99999.0f;
-    out->qx = 0.0f; out->qy = 0.0f; out->qz = 0.0f; out->qw = 1.0f;
+    if (!imu->valid) {
+    imu->yaw_var = 99999.0f;
+    imu->qx = 0.0f; imu->qy = 0.0f; imu->qz = 0.0f; imu->qw = 1.0f;
     }
 
     return true;
@@ -545,13 +554,25 @@ void subscription_callback_servo(const void * msgin)
 
 void core1_entry(void)
 {
-    uint8_t imu  = 0;
+    i2c_inst_t* i2c_port = i2c1;
+    initI2C(i2c_port, false);
+
+    _int_pin = -1;
+    _reset_pin = -1;
+
+    while (!IMU.begin(0x4B, i2c_port)) {   // pon 0x4A si tu scan era 0x4A
+        sleep_ms(50);
+    }
+    IMU.enableRotationVector(10);
+    IMU.enableGyro(10);
+    IMU.enableLinearAccelerometer(10);   
+
     gnss_fix_t gnss;
     gnss_heading_t gnss_heading;
     uint8_t current_angle;
-    
-    absolute_time_t next_imu  = get_absolute_time();
 
+    imu_t imu;    
+    absolute_time_t next_imu  = get_absolute_time();
     const int imu_period_us  = TIMER_IMU_MS  * 1000;
 
     char line[220];
@@ -560,11 +581,46 @@ void core1_entry(void)
     while (true)
     {
         absolute_time_t now = get_absolute_time();
+        bool got_any = false;
+
+        if (IMU.getSensorEvent()) {
+
+        uint8_t sid = IMU.getSensorEventID();
+
+        if (sid == SENSOR_REPORTID_ROTATION_VECTOR) {
+            imu.qx = IMU.getQuatI();
+            imu.qy = IMU.getQuatJ();
+            imu.qz = IMU.getQuatK();
+            imu.qw = IMU.getQuatReal();
+            got_any = true;
+        }
+        else if (sid == SENSOR_REPORTID_GYROSCOPE_CALIBRATED) {
+            imu.gx = IMU.getGyroX();
+            imu.gy = IMU.getGyroY();
+            imu.gz = IMU.getGyroZ();
+            got_any = true;
+        }
+        else if (sid == SENSOR_REPORTID_LINEAR_ACCELERATION) {
+            imu.ax = IMU.getLinAccelX();
+            imu.ay = IMU.getLinAccelY();
+            imu.az = IMU.getLinAccelZ();
+            got_any = true;
+        }
+
+        // Si el BNO se resetea, re-habilita reports
+        if (IMU.wasReset()) {
+            IMU.enableRotationVector(10);
+            IMU.enableGyro(10);
+            IMU.enableLinearAccelerometer(10);
+        }
+        }
 
         if (absolute_time_diff_us(now, next_imu) <= 0) {
-            next_imu = delayed_by_us(next_imu, imu_period_us);
-            imu++;
-            queue_push_latest(&q_imu, &imu, &imu_old);
+        next_imu = delayed_by_us(next_imu, imu_period_us);
+
+        imu.valid = true;
+
+        queue_push_latest(&q_imu, &imu, &imu_old);
         }
 
         while (uart_is_readable(GNSS_UART)) {
@@ -645,7 +701,7 @@ int main(void)
     uart_set_fifo_enabled(GNSS_UART, true);
 
     // Colas Core
-    queue_init(&q_imu,  sizeof(uint8_t),  16);
+    queue_init(&q_imu,  sizeof(imu_t),  8);
     queue_init(&q_gnss, sizeof(gnss_fix_t),  8);
     queue_init(&q_gnss_heading, sizeof(gnss_heading_t), 8);
     queue_init(&q_servo, sizeof(uint8_t), 8);
@@ -700,7 +756,7 @@ int main(void)
     RCABORT(rclc_publisher_init_default(&pub_gnss_heading_quality, &node, type_support_pub_gnss_heading_quality, "gnss/heading_quality"));
 
     // Configuración IMU
-    const rosidl_message_type_support_t * type_support_pub_imu = ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, UInt8);
+    const rosidl_message_type_support_t * type_support_pub_imu = ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, Imu);
     RCABORT(rclc_publisher_init_best_effort(&pub_imu, &node, type_support_pub_imu, "imu"));
 
     // Incialización mensajes
@@ -716,7 +772,13 @@ int main(void)
     std_msgs__msg__UInt8__init(&gnss_quality_msg);
     sensor_msgs__msg__Imu__init(&gnss_heading_msg);    
     std_msgs__msg__UInt8__init(&gnss_heading_quality_msg);
-    std_msgs__msg__UInt8__init(&imu_msg);
+    sensor_msgs__msg__Imu__init(&imu_msg);
+
+    rosidl_runtime_c__String__assign(&gnss_msg.header.frame_id, "imu_link");
+    // covarianzas: -1 = desconocido (válido)
+    imu_msg.orientation_covariance[0] = -1;
+    imu_msg.angular_velocity_covariance[0] = -1;
+    imu_msg.linear_acceleration_covariance[0] = -1;
 
     rosidl_runtime_c__String__assign(&gnss_msg.header.frame_id, "gnss");
     gnss_msg.position_covariance_type = sensor_msgs__msg__NavSatFix__COVARIANCE_TYPE_UNKNOWN;
@@ -747,8 +809,24 @@ int main(void)
         rclc_executor_spin_some(&executor, RCL_MS_TO_NS(1));
 
         if (queue_try_get_latest(&q_imu, &imu_latest)) {
-            imu_msg.data = imu_latest;
-            RCCONTINUE(rcl_publish(&pub_imu, &imu_msg, NULL));
+
+        now_us = time_us_64();
+        stamp_from_us(&imu_msg.header.stamp, now_us);
+
+        imu_msg.orientation.x = imu_latest.qx;
+        imu_msg.orientation.y = imu_latest.qy;
+        imu_msg.orientation.z = imu_latest.qz;
+        imu_msg.orientation.w = imu_latest.qw;
+
+        imu_msg.angular_velocity.x = imu_latest.gx;
+        imu_msg.angular_velocity.y = imu_latest.gy;
+        imu_msg.angular_velocity.z = imu_latest.gz;
+
+        imu_msg.linear_acceleration.x = imu_latest.ax;
+        imu_msg.linear_acceleration.y = imu_latest.ay;
+        imu_msg.linear_acceleration.z = imu_latest.az;
+
+        RCCONTINUE(rcl_publish(&pub_imu, &imu_msg, NULL));
         }
 
         if (queue_try_get_latest(&q_gnss, &gnss_latest)) {
