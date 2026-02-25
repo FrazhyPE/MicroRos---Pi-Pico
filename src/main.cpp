@@ -176,14 +176,14 @@ static volatile alarm_id_t cop_pattern_alarm = -1;
 static rcl_subscription_t sub_LIGHT;
 static rcl_publisher_t pub_LIGHT;
 
-static std_msgs__msg__Bool LIGHT_req_msg;
+static std_msgs__msg__UInt8 LIGHT_req_msg;
 static std_msgs__msg__Bool LIGHT_resp_msg;
 
 // led CAM
 static rcl_subscription_t sub_CAM;
 static rcl_publisher_t pub_CAM;
 
-static std_msgs__msg__Bool CAM_req_msg;
+static std_msgs__msg__UInt8 CAM_req_msg;
 static std_msgs__msg__Bool CAM_resp_msg;
 
 // Servo
@@ -207,7 +207,7 @@ static wiz_NetInfo netinfo = {
 };
 
 static wiz_uros_udp_params_t uros_params = {
-    .agent_ip   = {192, 168, 123, 222}, //18
+    .agent_ip   = {192, 168, 123, 18}, //18
     .agent_port = 8888,
     .local_port = 9999
 };
@@ -501,7 +501,7 @@ void subscription_callback_cop(const void * msgin)
 // Callback Light
 void subscription_callback_light(const void * msgin)
 {
-  const std_msgs__msg__Bool * msg = (const std_msgs__msg__Bool *)msgin;
+  const std_msgs__msg__UInt8 * msg = (const std_msgs__msg__UInt8 *)msgin;
   
   LIGHT_resp_msg.data = false;
 
@@ -518,7 +518,7 @@ void subscription_callback_light(const void * msgin)
 // Callback CAM
 void subscription_callback_cam(const void * msgin)
 {
-  const std_msgs__msg__Bool * msg = (const std_msgs__msg__Bool *)msgin;
+  const std_msgs__msg__UInt8 * msg = (const std_msgs__msg__UInt8 *)msgin;
   
   CAM_resp_msg.data = false;
 
@@ -557,71 +557,67 @@ void core1_entry(void)
     i2c_inst_t* i2c_port = i2c1;
     initI2C(i2c_port, false);
 
-    _int_pin = -1;
-    _reset_pin = -1;
+    _reset_pin = 1;
+    gpio_init(_reset_pin);
+    gpio_set_dir(_reset_pin, GPIO_OUT);
+    gpio_put(_reset_pin, 0);
+    sleep_ms(10);
+    gpio_put(_reset_pin, 1);
+    sleep_ms(100);
 
-    while (!IMU.begin(0x4B, i2c_port)) {   // pon 0x4A si tu scan era 0x4A
+    _int_pin = 4;
+    gpio_init(_int_pin);
+    gpio_set_dir(_int_pin, GPIO_IN);
+    gpio_pull_up(_int_pin);
+
+    while (!IMU.begin(0x4B, i2c_port)) {
         sleep_ms(50);
     }
+
     IMU.enableRotationVector(10);
-    IMU.enableGyro(10);
-    IMU.enableLinearAccelerometer(10);   
+    IMU.enableGyro(20);
+    IMU.enableLinearAccelerometer(20);
 
     gnss_fix_t gnss;
     gnss_heading_t gnss_heading;
-    uint8_t current_angle;
 
-    imu_t imu;    
-    absolute_time_t next_imu  = get_absolute_time();
-    const int imu_period_us  = TIMER_IMU_MS  * 1000;
+    imu_t imu = {0};    
+    uint8_t sid;
 
     char line[220];
     int idx = 0;
 
     while (true)
     {
-        absolute_time_t now = get_absolute_time();
-        bool got_any = false;
+        bool got_rv = false;
+        while (IMU.getSensorEvent()) {
+            sid = IMU.getSensorEventID();
 
-        if (IMU.getSensorEvent()) {
-
-        uint8_t sid = IMU.getSensorEventID();
-
-        if (sid == SENSOR_REPORTID_ROTATION_VECTOR) {
-            imu.qx = IMU.getQuatI();
-            imu.qy = IMU.getQuatJ();
-            imu.qz = IMU.getQuatK();
-            imu.qw = IMU.getQuatReal();
-            got_any = true;
-        }
-        else if (sid == SENSOR_REPORTID_GYROSCOPE_CALIBRATED) {
-            imu.gx = IMU.getGyroX();
-            imu.gy = IMU.getGyroY();
-            imu.gz = IMU.getGyroZ();
-            got_any = true;
-        }
-        else if (sid == SENSOR_REPORTID_LINEAR_ACCELERATION) {
+            if (sid == SENSOR_REPORTID_ROTATION_VECTOR) {
+                imu.qx = IMU.getQuatI();
+                imu.qy = IMU.getQuatJ();
+                imu.qz = IMU.getQuatK();
+                imu.qw = IMU.getQuatReal();
+                got_rv = true;
+            }
+            else if (sid == SENSOR_REPORTID_GYROSCOPE_CALIBRATED) {
+                imu.gx = IMU.getGyroX();
+                imu.gy = IMU.getGyroY();
+                imu.gz = IMU.getGyroZ();
+            }
+            else if (sid == SENSOR_REPORTID_LINEAR_ACCELERATION) {
             imu.ax = IMU.getLinAccelX();
             imu.ay = IMU.getLinAccelY();
             imu.az = IMU.getLinAccelZ();
-            got_any = true;
         }
 
-        // Si el BNO se resetea, re-habilita reports
-        if (IMU.wasReset()) {
-            IMU.enableRotationVector(10);
-            IMU.enableGyro(10);
-            IMU.enableLinearAccelerometer(10);
+            if (IMU.wasReset()) {
+                IMU.enableRotationVector(10);
+                IMU.enableGyro(20);
+                IMU.enableLinearAccelerometer(20);
+            }
         }
-        }
-
-        if (absolute_time_diff_us(now, next_imu) <= 0) {
-        next_imu = delayed_by_us(next_imu, imu_period_us);
-
-        imu.valid = true;
-
-        queue_push_latest(&q_imu, &imu, &imu_old);
-        }
+        if (got_rv) queue_push_latest(&q_imu, &imu, &imu_old);
 
         while (uart_is_readable(GNSS_UART)) {
             char c = (char)uart_getc(GNSS_UART);
@@ -722,14 +718,14 @@ int main(void)
     RCABORT(rclc_publisher_init_default(&pub_COP, &node, type_support_pub_cop, "led_cop/resp"));
 
     // Configuración LIGHT
-    const rosidl_message_type_support_t * type_support_sub_light = ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Bool);
+    const rosidl_message_type_support_t * type_support_sub_light = ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, UInt8);
     RCABORT(rclc_subscription_init_default(&sub_LIGHT, &node, type_support_sub_light, "led_light/req"));
 
     const rosidl_message_type_support_t * type_support_pub_light = ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Bool);
     RCABORT(rclc_publisher_init_default(&pub_LIGHT, &node, type_support_pub_light, "led_light/resp"));
 
     // Configuración CAM
-    const rosidl_message_type_support_t * type_support_sub_cam = ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Bool);
+    const rosidl_message_type_support_t * type_support_sub_cam = ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, UInt8);
     RCABORT(rclc_subscription_init_default(&sub_CAM, &node, type_support_sub_cam, "led_cam/req"));
 
     const rosidl_message_type_support_t * type_support_pub_cam = ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Bool);
@@ -762,9 +758,9 @@ int main(void)
     // Incialización mensajes
     std_msgs__msg__UInt8__init(&COP_req_msg);
     std_msgs__msg__Bool__init(&COP_resp_msg);
-    std_msgs__msg__Bool__init(&LIGHT_req_msg);  
+    std_msgs__msg__UInt8__init(&LIGHT_req_msg);  
     std_msgs__msg__Bool__init(&LIGHT_resp_msg);
-    std_msgs__msg__Bool__init(&CAM_req_msg);
+    std_msgs__msg__UInt8__init(&CAM_req_msg);
     std_msgs__msg__Bool__init(&CAM_resp_msg);
     std_msgs__msg__UInt8__init(&SERVO_req_msg);
     std_msgs__msg__Bool__init(&SERVO_resp_msg);
@@ -774,7 +770,7 @@ int main(void)
     std_msgs__msg__UInt8__init(&gnss_heading_quality_msg);
     sensor_msgs__msg__Imu__init(&imu_msg);
 
-    rosidl_runtime_c__String__assign(&gnss_msg.header.frame_id, "imu_link");
+    rosidl_runtime_c__String__assign(&imu_msg.header.frame_id, "imu_link");
     // covarianzas: -1 = desconocido (válido)
     imu_msg.orientation_covariance[0] = -1;
     imu_msg.angular_velocity_covariance[0] = -1;

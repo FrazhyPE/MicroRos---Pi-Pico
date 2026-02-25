@@ -8,7 +8,7 @@
 
 namespace CONFIG {
 
-    inline uint I2C_TIMEOUT_US = 50000;
+    inline uint I2C_TIMEOUT_US = 500000;
 
     constexpr uint I2C_BAUD_RATE = 100 * 1000; // 350kHz
     constexpr uint I2C_SDA_PIN = 2; // GP4 pin 6;
