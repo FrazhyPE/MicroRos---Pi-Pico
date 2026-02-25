@@ -79,6 +79,7 @@ target_link_libraries(pico_uros_w5500
   hardware_i2c
   hardware_gpio
   BNO08x_Pico_Library
+  hardware_adc
 )
 
 pico_enable_stdio_usb(pico_uros_w5500 1)

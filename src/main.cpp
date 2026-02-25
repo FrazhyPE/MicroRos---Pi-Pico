@@ -35,6 +35,7 @@ extern "C" {
 #include "hardware/uart.h"
 #include "pico/multicore.h"
 #include "pico/util/queue.h"
+#include "hardware/adc.h"
 #include <SCServo.h>
 
 #include "bno08x.h"
@@ -42,8 +43,11 @@ extern "C" {
 
 #define RCABORT(fn) do {rcl_ret_t rc = fn; if(rc != RCL_RET_OK){ printf("Error en la línea %d: %d. Abortando...\n",__LINE__,(int)rc); sleep_ms(1000); watchdog_reboot(0,0,0);}} while (0)
 #define RCCONTINUE(fn) do {rcl_ret_t rc = fn; if(rc != RCL_RET_OK){ printf("Error en la línea %d: %d. Continuando...\n",__LINE__,(int)rc);}} while (0)
-#define COP_PULSE_MS 75
-#define TIMER_IMU_MS 10
+
+#define IMU_QUAT 10
+#define IMU_GYRO 20
+#define IMU_LINACC 20
+
 #define GNSS_UART uart1
 #define GNSS_BAUD 115200
 #define GNSS_TX_PIN 8
@@ -58,9 +62,24 @@ extern "C" {
 #define SERVO_SPEED 1500
 #define SERVO_ACC 50
 
+#define COP_PULSE_MS 75
+
 /*********************************/
 /*          Estructuras          */
 /*********************************/
+
+typedef struct {
+    float qx;
+    float qy;
+    float qz;
+    float qw;
+    float gx;
+    float gy;
+    float gz;
+    float ax;
+    float ay;
+    float az;
+} imu_t;
 
 typedef struct {
     double lat_deg;
@@ -82,57 +101,53 @@ typedef struct {
     uint8_t quality;
 } gnss_heading_t;
 
-typedef struct {
-    float qx;
-    float qy;
-    float qz;
-    float qw;
-    float gx;
-    float gy;
-    float gz;
-    float ax;
-    float ay;
-    float az;
-    uint8_t calib_status;
-    bool valid;
-} imu_t;
-
-SMS_STS st;
-
 /*********************************/
 /*      Declaración de Pines     */
 /*********************************/
 
+static const int8_t _reset_pin = 1;
+static const int8_t _int_pin = 4;
+
 const uint COP_LED = 0;
 const uint COP_PATHERN = 5;
+
 const uint LIGHT = 14;
+
 const uint CAM = 15;
+
+const uint LED_RGB = 22;
+
+const uint PGOOD = 10;
+
+const uint CURRENT = 28;
 
 /*********************************/
 /*       Variables Globales      */
 /*********************************/
 
+static queue_t q_imu;
 static queue_t q_gnss;
 static queue_t q_gnss_heading;
-static queue_t q_imu;
 static queue_t q_servo;
 
+// IMU
 imu_t imu_old;
 imu_t imu_latest;
 
+static BNO08x IMU;
+
+// GNSS
 gnss_fix_t gnss_old;
 gnss_fix_t gnss_latest;
 
 gnss_heading_t gnss_heading_old;
 gnss_heading_t gnss_heading_latest;
 
+// SERVO
 uint8_t servo_old;
 uint8_t servo_latest;
 
-extern int8_t _reset_pin;
-extern int8_t _int_pin;
-
-static BNO08x IMU;
+SMS_STS st;
 
 /*********************************/
 /*    Estructuras Micro - ROS    */
@@ -144,6 +159,10 @@ static rcl_node_t node;
 // Agente ROS
 static absolute_time_t next_ping;
 static uint8_t ping_fail = 0;
+
+// IMU
+static rcl_publisher_t pub_imu;
+static sensor_msgs__msg__Imu imu_msg;
 
 // GNSS
 static rcl_publisher_t pub_gnss;
@@ -158,10 +177,12 @@ static sensor_msgs__msg__Imu gnss_heading_msg;
 static rcl_publisher_t pub_gnss_heading_quality;
 static std_msgs__msg__UInt8 gnss_heading_quality_msg;
 
-// IMU
-static rcl_publisher_t pub_imu;
-static sensor_msgs__msg__Imu imu_msg;
+// Servo
+static rcl_subscription_t sub_SERVO;
+static rcl_publisher_t pub_SERVO;
 
+static std_msgs__msg__UInt8 SERVO_req_msg;
+static std_msgs__msg__Bool SERVO_resp_msg;
 
 // Led COP
 static rcl_subscription_t sub_COP;
@@ -185,13 +206,6 @@ static rcl_publisher_t pub_CAM;
 
 static std_msgs__msg__UInt8 CAM_req_msg;
 static std_msgs__msg__Bool CAM_resp_msg;
-
-// Servo
-static rcl_subscription_t sub_SERVO;
-static rcl_publisher_t pub_SERVO;
-
-static std_msgs__msg__UInt8 SERVO_req_msg;
-static std_msgs__msg__Bool SERVO_resp_msg;
 
 /*********************************/
 /*         Conexión UDP          */
@@ -231,6 +245,14 @@ static void wiznet_init(void)
 
 void gpio_init_custom(void)
 {
+    gpio_init(_reset_pin);
+    gpio_set_dir(_reset_pin, GPIO_OUT);
+    gpio_put(_reset_pin, 1);
+
+    gpio_init(_int_pin);
+    gpio_set_dir(_int_pin, GPIO_IN);
+    gpio_pull_up(_int_pin);
+
     gpio_init(COP_LED);
     gpio_set_dir(COP_LED, GPIO_OUT);
     gpio_put(COP_LED, 0);
@@ -246,6 +268,17 @@ void gpio_init_custom(void)
     gpio_init(CAM);
     gpio_set_dir(CAM, GPIO_OUT);
     gpio_put(CAM, 0);
+
+    gpio_init(LED_RGB);
+    gpio_set_dir(LED_RGB, GPIO_OUT);
+    gpio_put(LED_RGB, 0);
+
+    gpio_init(PGOOD);
+    gpio_set_dir(PGOOD, GPIO_IN);
+
+    adc_init();
+    adc_gpio_init(CURRENT);
+    adc_select_input(2);
 }
 
 /*********************************/
@@ -447,6 +480,22 @@ static int8_t navsat_status_from_fixq(uint8_t fixq)
 /*    Callbacks Timer y Subs     */
 /*********************************/
 
+//Callback Servo
+void subscription_callback_servo(const void * msgin)
+{
+  const std_msgs__msg__UInt8 * msg = (const std_msgs__msg__UInt8 *)msgin;
+  
+  SERVO_resp_msg.data = false;
+  uint8_t a = msg->data;
+
+  if (a <= 180) {
+    queue_push_latest(&q_servo, &a, &servo_old);
+    SERVO_resp_msg.data = true;
+  }
+
+  RCCONTINUE(rcl_publish(&pub_SERVO, &SERVO_resp_msg, NULL));
+}
+
 // Callback Led COP
 static int64_t cop_pattern_off_cb(alarm_id_t id, void *user_data)
 {
@@ -532,63 +581,44 @@ void subscription_callback_cam(const void * msgin)
   RCCONTINUE(rcl_publish(&pub_CAM, &CAM_resp_msg, NULL));
 }
 
-//Callback Servo
-void subscription_callback_servo(const void * msgin)
-{
-  const std_msgs__msg__UInt8 * msg = (const std_msgs__msg__UInt8 *)msgin;
-  
-  SERVO_resp_msg.data = false;
-  uint8_t a = msg->data;
-
-  if (a <= 180) {
-    queue_push_latest(&q_servo, &a, &servo_old);
-    SERVO_resp_msg.data = true;
-  }
-
-  RCCONTINUE(rcl_publish(&pub_SERVO, &SERVO_resp_msg, NULL));
-}
-
 /*********************************/
-/*       Función Secundaria      */
+/*        Nucleo Secundario      */
 /*********************************/
 
 void core1_entry(void)
-{
+{   
+    // Inicialización I2C IMU
     i2c_inst_t* i2c_port = i2c1;
     initI2C(i2c_port, false);
 
-    _reset_pin = 1;
-    gpio_init(_reset_pin);
-    gpio_set_dir(_reset_pin, GPIO_OUT);
     gpio_put(_reset_pin, 0);
     sleep_ms(10);
     gpio_put(_reset_pin, 1);
     sleep_ms(100);
 
-    _int_pin = 4;
-    gpio_init(_int_pin);
-    gpio_set_dir(_int_pin, GPIO_IN);
-    gpio_pull_up(_int_pin);
-
     while (!IMU.begin(0x4B, i2c_port)) {
         sleep_ms(50);
     }
 
-    IMU.enableRotationVector(10);
-    IMU.enableGyro(20);
-    IMU.enableLinearAccelerometer(20);
+    IMU.enableRotationVector(IMU_QUAT);
+    IMU.enableGyro(IMU_GYRO);
+    IMU.enableLinearAccelerometer(IMU_LINACC);
 
+    imu_t imu = {0};
+
+    // Inicialización GNSS
     gnss_fix_t gnss;
     gnss_heading_t gnss_heading;
 
-    imu_t imu = {0};    
+    // Inicialización Servo
     uint8_t sid;
 
     char line[220];
     int idx = 0;
 
     while (true)
-    {
+    {   
+        // IMU
         bool got_rv = false;
         while (IMU.getSensorEvent()) {
             sid = IMU.getSensorEventID();
@@ -609,16 +639,17 @@ void core1_entry(void)
             imu.ax = IMU.getLinAccelX();
             imu.ay = IMU.getLinAccelY();
             imu.az = IMU.getLinAccelZ();
-        }
+            }
 
             if (IMU.wasReset()) {
-                IMU.enableRotationVector(10);
-                IMU.enableGyro(20);
-                IMU.enableLinearAccelerometer(20);
+                IMU.enableRotationVector(IMU_QUAT);
+                IMU.enableGyro(IMU_GYRO);
+                IMU.enableLinearAccelerometer(IMU_LINACC);
             }
         }
         if (got_rv) queue_push_latest(&q_imu, &imu, &imu_old);
 
+        // GNSS
         while (uart_is_readable(GNSS_UART)) {
             char c = (char)uart_getc(GNSS_UART);
 
@@ -643,19 +674,19 @@ void core1_entry(void)
             }
         }
 
+        // SERVO
         if (queue_try_get_latest(&q_servo, &servo_latest)) {
             uint8_t angle = servo_latest;
             uint16_t pos = (uint16_t)(angle*512.0/45.0+1024.0);
 
             st.WritePosEx(SERVO_ID, pos, SERVO_SPEED, SERVO_ACC);
         }
-
         tight_loop_contents();
     }
 }
 
 /*********************************/
-/*       Función Principal       */
+/*        Nucelo Principal       */
 /*********************************/
 
 int main(void)
@@ -679,22 +710,21 @@ int main(void)
     // Configuración Pines
     gpio_init_custom();
 
-    // Configuración UART para Servo
-    uart_init(SERVO_UART, SERVO_BAUD);
-    gpio_set_function(SERVO_TX_PIN, GPIO_FUNC_UART);
-    gpio_set_function(SERVO_RX_PIN, GPIO_FUNC_UART);
-    uart_set_format(SERVO_UART, 8, 1, UART_PARITY_NONE);
-    uart_set_fifo_enabled(SERVO_UART, true);
-    
-    st.setUart(SERVO_UART); 
-
-    // Configuración UART1
+    // Configuración UART1 para GNSS
 
     uart_init(GNSS_UART, GNSS_BAUD);
     gpio_set_function(GNSS_TX_PIN, GPIO_FUNC_UART);
     gpio_set_function(GNSS_RX_PIN, GPIO_FUNC_UART);
     uart_set_format(GNSS_UART, 8, 1, UART_PARITY_NONE);
     uart_set_fifo_enabled(GNSS_UART, true);
+
+    // Configuración UART para Servo
+    uart_init(SERVO_UART, SERVO_BAUD);
+    gpio_set_function(SERVO_TX_PIN, GPIO_FUNC_UART);
+    gpio_set_function(SERVO_RX_PIN, GPIO_FUNC_UART);
+    uart_set_format(SERVO_UART, 8, 1, UART_PARITY_NONE);
+    uart_set_fifo_enabled(SERVO_UART, true);
+    st.setUart(SERVO_UART); 
 
     // Colas Core
     queue_init(&q_imu,  sizeof(imu_t),  8);
@@ -709,6 +739,30 @@ int main(void)
     rclc_support_t support;
     RCABORT(rclc_support_init(&support, 0, NULL, &allocator));
     RCABORT(rclc_node_init_default(&node, "node", "pico", &support));
+
+    // Configuración IMU
+    const rosidl_message_type_support_t * type_support_pub_imu = ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, Imu);
+    RCABORT(rclc_publisher_init_best_effort(&pub_imu, &node, type_support_pub_imu, "imu"));
+
+    // Configuración GNSS
+    const rosidl_message_type_support_t * type_support_pub_gnss = ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, NavSatFix);
+    RCABORT(rclc_publisher_init_default(&pub_gnss, &node, type_support_pub_gnss, "gnss/fix"));
+
+    const rosidl_message_type_support_t * type_support_pub_gnss_quality = ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, UInt8);
+    RCABORT(rclc_publisher_init_default(&pub_gnss_quality, &node, type_support_pub_gnss_quality, "gnss/fix_quality"));
+
+    const rosidl_message_type_support_t * type_support_pub_gnss_heading = ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, Imu);
+    RCABORT(rclc_publisher_init_default(&pub_gnss_heading, &node, type_support_pub_gnss_heading, "gnss/heading"));
+
+    const rosidl_message_type_support_t * type_support_pub_gnss_heading_quality = ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, UInt8);
+    RCABORT(rclc_publisher_init_default(&pub_gnss_heading_quality, &node, type_support_pub_gnss_heading_quality, "gnss/heading_quality"));
+
+    // Configuración SERVO
+    const rosidl_message_type_support_t * type_support_sub_servo = ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, UInt8);
+    RCABORT(rclc_subscription_init_default(&sub_SERVO, &node, type_support_sub_servo, "servo/req"));
+
+    const rosidl_message_type_support_t * type_support_pub_servo = ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Bool);
+    RCABORT(rclc_publisher_init_default(&pub_SERVO, &node, type_support_pub_servo, "servo/resp"));
 
     // Configuración LED COP
     const rosidl_message_type_support_t * type_support_sub_cop = ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, UInt8);
@@ -731,51 +785,30 @@ int main(void)
     const rosidl_message_type_support_t * type_support_pub_cam = ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Bool);
     RCABORT(rclc_publisher_init_default(&pub_CAM, &node, type_support_pub_cam, "led_cam/resp"));
 
-    // Configuración SERVO
-    const rosidl_message_type_support_t * type_support_sub_servo = ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, UInt8);
-    RCABORT(rclc_subscription_init_default(&sub_SERVO, &node, type_support_sub_servo, "servo/req"));
-
-    const rosidl_message_type_support_t * type_support_pub_servo = ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Bool);
-    RCABORT(rclc_publisher_init_default(&pub_SERVO, &node, type_support_pub_servo, "servo/resp"));
-
-    // Configuración GNSS
-    const rosidl_message_type_support_t * type_support_pub_gnss = ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, NavSatFix);
-    RCABORT(rclc_publisher_init_default(&pub_gnss, &node, type_support_pub_gnss, "gnss/fix"));
-
-    const rosidl_message_type_support_t * type_support_pub_gnss_quality = ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, UInt8);
-    RCABORT(rclc_publisher_init_default(&pub_gnss_quality, &node, type_support_pub_gnss_quality, "gnss/fix_quality"));
-
-    const rosidl_message_type_support_t * type_support_pub_gnss_heading = ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, Imu);
-    RCABORT(rclc_publisher_init_default(&pub_gnss_heading, &node, type_support_pub_gnss_heading, "gnss/heading"));
-
-    const rosidl_message_type_support_t * type_support_pub_gnss_heading_quality = ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, UInt8);
-    RCABORT(rclc_publisher_init_default(&pub_gnss_heading_quality, &node, type_support_pub_gnss_heading_quality, "gnss/heading_quality"));
-
-    // Configuración IMU
-    const rosidl_message_type_support_t * type_support_pub_imu = ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, Imu);
-    RCABORT(rclc_publisher_init_best_effort(&pub_imu, &node, type_support_pub_imu, "imu"));
-
     // Incialización mensajes
+    sensor_msgs__msg__Imu__init(&imu_msg);
+    sensor_msgs__msg__NavSatFix__init(&gnss_msg);
+    std_msgs__msg__UInt8__init(&gnss_quality_msg);
+    sensor_msgs__msg__Imu__init(&gnss_heading_msg);    
+    std_msgs__msg__UInt8__init(&gnss_heading_quality_msg);
+    std_msgs__msg__UInt8__init(&SERVO_req_msg);
+    std_msgs__msg__Bool__init(&SERVO_resp_msg);
     std_msgs__msg__UInt8__init(&COP_req_msg);
     std_msgs__msg__Bool__init(&COP_resp_msg);
     std_msgs__msg__UInt8__init(&LIGHT_req_msg);  
     std_msgs__msg__Bool__init(&LIGHT_resp_msg);
     std_msgs__msg__UInt8__init(&CAM_req_msg);
     std_msgs__msg__Bool__init(&CAM_resp_msg);
-    std_msgs__msg__UInt8__init(&SERVO_req_msg);
-    std_msgs__msg__Bool__init(&SERVO_resp_msg);
-    sensor_msgs__msg__NavSatFix__init(&gnss_msg);
-    std_msgs__msg__UInt8__init(&gnss_quality_msg);
-    sensor_msgs__msg__Imu__init(&gnss_heading_msg);    
-    std_msgs__msg__UInt8__init(&gnss_heading_quality_msg);
-    sensor_msgs__msg__Imu__init(&imu_msg);
 
+    // Configuración campos constantes mensajes
+
+    // IMU
     rosidl_runtime_c__String__assign(&imu_msg.header.frame_id, "imu_link");
-    // covarianzas: -1 = desconocido (válido)
     imu_msg.orientation_covariance[0] = -1;
     imu_msg.angular_velocity_covariance[0] = -1;
     imu_msg.linear_acceleration_covariance[0] = -1;
 
+    // GNSS
     rosidl_runtime_c__String__assign(&gnss_msg.header.frame_id, "gnss");
     gnss_msg.position_covariance_type = sensor_msgs__msg__NavSatFix__COVARIANCE_TYPE_UNKNOWN;
 
@@ -792,41 +825,38 @@ int main(void)
     RCABORT(rclc_executor_add_subscription(&executor, &sub_LIGHT, &LIGHT_req_msg, &subscription_callback_light, ON_NEW_DATA));
     RCABORT(rclc_executor_add_subscription(&executor, &sub_CAM, &CAM_req_msg, &subscription_callback_cam, ON_NEW_DATA));
     RCABORT(rclc_executor_add_subscription(&executor, &sub_SERVO, &SERVO_req_msg, &subscription_callback_servo, ON_NEW_DATA));
-
     rclc_executor_set_timeout(&executor, RCL_MS_TO_NS(5));
 
     next_ping = make_timeout_time_ms(1000);
     ping_fail = 0;
-    
     uint64_t now_us;
     
+    // Publicación Topics
     while (true)
     {
         rclc_executor_spin_some(&executor, RCL_MS_TO_NS(1));
 
         if (queue_try_get_latest(&q_imu, &imu_latest)) {
+            now_us = time_us_64();
+            stamp_from_us(&imu_msg.header.stamp, now_us);
 
-        now_us = time_us_64();
-        stamp_from_us(&imu_msg.header.stamp, now_us);
+            imu_msg.orientation.x = imu_latest.qx;
+            imu_msg.orientation.y = imu_latest.qy;
+            imu_msg.orientation.z = imu_latest.qz;
+            imu_msg.orientation.w = imu_latest.qw;
 
-        imu_msg.orientation.x = imu_latest.qx;
-        imu_msg.orientation.y = imu_latest.qy;
-        imu_msg.orientation.z = imu_latest.qz;
-        imu_msg.orientation.w = imu_latest.qw;
+            imu_msg.angular_velocity.x = imu_latest.gx;
+            imu_msg.angular_velocity.y = imu_latest.gy;
+            imu_msg.angular_velocity.z = imu_latest.gz;
 
-        imu_msg.angular_velocity.x = imu_latest.gx;
-        imu_msg.angular_velocity.y = imu_latest.gy;
-        imu_msg.angular_velocity.z = imu_latest.gz;
+            imu_msg.linear_acceleration.x = imu_latest.ax;
+            imu_msg.linear_acceleration.y = imu_latest.ay;
+            imu_msg.linear_acceleration.z = imu_latest.az;
 
-        imu_msg.linear_acceleration.x = imu_latest.ax;
-        imu_msg.linear_acceleration.y = imu_latest.ay;
-        imu_msg.linear_acceleration.z = imu_latest.az;
-
-        RCCONTINUE(rcl_publish(&pub_imu, &imu_msg, NULL));
+            RCCONTINUE(rcl_publish(&pub_imu, &imu_msg, NULL));
         }
 
         if (queue_try_get_latest(&q_gnss, &gnss_latest)) {
-
             now_us = time_us_64();
             stamp_from_us(&gnss_msg.header.stamp, now_us);
 
@@ -847,7 +877,6 @@ int main(void)
         }
 
         if (queue_try_get_latest(&q_gnss_heading, &gnss_heading_latest)) {
-            
             now_us = time_us_64();
             stamp_from_us(&gnss_heading_msg.header.stamp, now_us);
 
@@ -866,8 +895,7 @@ int main(void)
             RCCONTINUE(rcl_publish(&pub_gnss_heading_quality, &gnss_heading_quality_msg, NULL));
         }
         
-        if (absolute_time_diff_us(get_absolute_time(), next_ping) <= 0)
-        {
+        if (absolute_time_diff_us(get_absolute_time(), next_ping) <= 0){
             next_ping = make_timeout_time_ms(1000);
 
             bool ok = false;
@@ -890,15 +918,27 @@ int main(void)
         }
     }
 
+    // Finalización de recursos
     rclc_executor_fini(&executor);
-    rcl_publisher_fini(&pub_COP, &node);
-    rcl_publisher_fini(&pub_LIGHT, &node);
-    rcl_publisher_fini(&pub_CAM, &node);
+
+    rcl_publisher_fini(&pub_imu, &node);
+    rcl_publisher_fini(&pub_gnss, &node);
+    rcl_publisher_fini(&pub_gnss_quality, &node);
+    rcl_publisher_fini(&pub_gnss_heading, &node);
+    rcl_publisher_fini(&pub_gnss_heading_quality, &node);
+
     rcl_publisher_fini(&pub_SERVO, &node);
-    rcl_subscription_fini(&sub_COP, &node);
-    rcl_subscription_fini(&sub_LIGHT, &node);
-    rcl_subscription_fini(&sub_CAM, &node);
     rcl_subscription_fini(&sub_SERVO, &node);
+
+    rcl_publisher_fini(&pub_COP, &node);
+    rcl_subscription_fini(&sub_COP, &node);
+
+    rcl_publisher_fini(&pub_LIGHT, &node);
+    rcl_subscription_fini(&sub_LIGHT, &node);
+
+    rcl_publisher_fini(&pub_CAM, &node);
+    rcl_subscription_fini(&sub_CAM, &node);
+
     rcl_node_fini(&node);
     rclc_support_fini(&support);
 
