@@ -41,6 +41,9 @@ extern "C" {
 #include "bno08x.h"
 #include "utils.h"
 
+#include "pico/stdlib.h"
+#include "WS2812.hpp"
+
 #define RCABORT(fn) do {rcl_ret_t rc = fn; if(rc != RCL_RET_OK){ printf("Error en la línea %d: %d. Abortando...\n",__LINE__,(int)rc); sleep_ms(1000); watchdog_reboot(0,0,0);}} while (0)
 #define RCCONTINUE(fn) do {rcl_ret_t rc = fn; if(rc != RCL_RET_OK){ printf("Error en la línea %d: %d. Continuando...\n",__LINE__,(int)rc);}} while (0)
 
@@ -58,7 +61,7 @@ extern "C" {
 #define SERVO_TX_PIN 12
 #define SERVO_RX_PIN 13 
 
-#define SERVO_ID 5
+#define SERVO_ID 1
 #define SERVO_SPEED 1500
 #define SERVO_ACC 50
 
@@ -116,6 +119,7 @@ const uint LIGHT = 14;
 const uint CAM = 15;
 
 const uint LED_RGB = 22;
+const uint LED_LENGTH = 1;
 
 const uint PGOOD = 10;
 
@@ -207,6 +211,11 @@ static rcl_publisher_t pub_CAM;
 static std_msgs__msg__UInt8 CAM_req_msg;
 static std_msgs__msg__Bool CAM_resp_msg;
 
+// led RGB
+static absolute_time_t next_led_update;
+static absolute_time_t next_led;
+uint8_t brillo = 0;
+
 /*********************************/
 /*         Conexión UDP          */
 /*********************************/
@@ -216,12 +225,22 @@ static wiz_NetInfo netinfo = {
     .ip  = {192, 168, 123, 2},
     .sn  = {255, 255, 255, 0},
     .gw  = {0, 0, 0, 0},
+
+    .lla = {0},
+    .gua = {0},
+    .sn6 = {0},
+    .gw6 = {0},
+
     .dns = {8, 8, 8, 8},
+    .dns6 = {0},
+
+    .ipmode = NETINFO_STATIC_ALL,
     .dhcp = NETINFO_STATIC
 };
 
+
 static wiz_uros_udp_params_t uros_params = {
-    .agent_ip   = {192, 168, 123, 18}, //18
+    .agent_ip   = {192, 168, 123, 18}, //18: unitree, 222: pc
     .agent_port = 8888,
     .local_port = 9999
 };
@@ -229,13 +248,11 @@ static wiz_uros_udp_params_t uros_params = {
 static void wiznet_init(void)
 {
     wizchip_spi_initialize();
-
     wizchip_cris_initialize();
-
+    wizchip_reset();
     wizchip_initialize();
-
-    wizchip_setnetinfo(&netinfo);
-
+    wizchip_check();
+    network_initialize(netinfo);
     sleep_ms(200);
 }
 
@@ -268,10 +285,6 @@ void gpio_init_custom(void)
     gpio_init(CAM);
     gpio_set_dir(CAM, GPIO_OUT);
     gpio_put(CAM, 0);
-
-    gpio_init(LED_RGB);
-    gpio_set_dir(LED_RGB, GPIO_OUT);
-    gpio_put(LED_RGB, 0);
 
     gpio_init(PGOOD);
     gpio_set_dir(PGOOD, GPIO_IN);
@@ -581,6 +594,13 @@ void subscription_callback_cam(const void * msgin)
   RCCONTINUE(rcl_publish(&pub_CAM, &CAM_resp_msg, NULL));
 }
 
+// Función Led RGB
+void change_led_rgb(WS2812* ledStrip, uint8_t r, uint8_t g, uint8_t b)
+{
+    ledStrip->fill(WS2812::RGB(r, g, b));
+    ledStrip->show();
+}
+
 /*********************************/
 /*        Nucleo Secundario      */
 /*********************************/
@@ -703,9 +723,36 @@ int main(void)
         wiz_uros_udp_write,
         wiz_uros_udp_read
     );
-    while (rmw_uros_ping_agent(1000, 1) != RCL_RET_OK) {
-        sleep_ms(500);
+
+    WS2812 ledStrip(
+        LED_RGB,           
+        LED_LENGTH,        
+        pio0,              
+        0,                 
+        WS2812::FORMAT_GRB 
+    );
+    
+    next_ping = make_timeout_time_ms(500);
+    next_led  = make_timeout_time_ms(300);
+
+    while (rmw_uros_ping_agent(100, 1) != RCL_RET_OK) {
+
+        if (absolute_time_diff_us(get_absolute_time(), next_ping) <= 0) {
+            next_ping = make_timeout_time_ms(500);
+
+            rmw_uros_ping_agent(100, 1);
+        }
+
+        if (absolute_time_diff_us(get_absolute_time(), next_led) <= 0) {
+            next_led = make_timeout_time_ms(300);
+
+            brillo = !brillo;
+
+            change_led_rgb(&ledStrip, brillo * 200, 0, 0);
+        }
     }
+
+    change_led_rgb(&ledStrip, 0, 200, 0);
 
     // Configuración Pines
     gpio_init_custom();
@@ -828,6 +875,7 @@ int main(void)
     rclc_executor_set_timeout(&executor, RCL_MS_TO_NS(5));
 
     next_ping = make_timeout_time_ms(1000);
+    next_led_update = make_timeout_time_ms(500);
     ping_fail = 0;
     uint64_t now_us;
     
@@ -916,6 +964,28 @@ int main(void)
                 watchdog_reboot(0, 0, 0);
             }
         }
+
+        if (absolute_time_diff_us(get_absolute_time(), next_led_update) <= 0) {
+            next_led_update = make_timeout_time_ms(800);
+
+            uint8_t base = 30 + rand() % 50;
+            uint8_t low1 = rand() % 20;
+            uint8_t low2 = rand() % 20;
+
+            uint8_t r, g, b;
+            int mode = rand() % 3;
+
+            if (mode == 0) {
+                r = base; g = low1; b = low2;
+            } else if (mode == 1) {
+                r = low1; g = base; b = low2;
+            } else {
+                r = low1; g = low2; b = base;
+            }
+
+            change_led_rgb(&ledStrip, r, g, b);
+        }
+
     }
 
     // Finalización de recursos
