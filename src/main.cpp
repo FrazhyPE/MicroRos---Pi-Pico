@@ -30,6 +30,7 @@ extern "C" {
 #include <sensor_msgs/msg/nav_sat_fix.h>
 #include <sensor_msgs/msg/nav_sat_status.h>
 #include <sensor_msgs/msg/imu.h>
+#include <my_robot_msgs/msg/servo_cmd.h>
 #include <rosidl_runtime_c/string_functions.h>
 
 #include "hardware/uart.h"
@@ -61,11 +62,12 @@ extern "C" {
 #define SERVO_TX_PIN 12
 #define SERVO_RX_PIN 13 
 
-#define SERVO_ID 1
 #define SERVO_SPEED 1500
 #define SERVO_ACC 50
 
 #define COP_PULSE_MS 75
+
+#define LED_LENGTH 1
 
 /*********************************/
 /*          Estructuras          */
@@ -89,8 +91,6 @@ typedef struct {
     double lon_deg;
     double alt_m;
     uint8_t fix_q;
-    uint8_t sats;
-    float hdop;
     bool valid;
 } gnss_fix_t;
 
@@ -104,22 +104,27 @@ typedef struct {
     uint8_t quality;
 } gnss_heading_t;
 
+typedef struct {
+    uint8_t id;
+    uint8_t angle;
+} servo_t;
+
 /*********************************/
 /*      Declaración de Pines     */
 /*********************************/
 
-static const int8_t _reset_pin = 1;
-static const int8_t _int_pin = 4;
+const uint BNO_RST = 1;
+const uint BNO_INT = 4;
 
 const uint COP_LED = 0;
 const uint COP_PATHERN = 5;
 
 const uint LIGHT = 14;
 
-const uint CAM = 15;
+const uint CAM1 = 15;
+const uint CAM2 = 26;
 
 const uint LED_RGB = 22;
-const uint LED_LENGTH = 1;
 
 const uint PGOOD = 10;
 
@@ -148,8 +153,8 @@ gnss_heading_t gnss_heading_old;
 gnss_heading_t gnss_heading_latest;
 
 // SERVO
-uint8_t servo_old;
-uint8_t servo_latest;
+servo_t servo_old;
+servo_t servo_latest;
 
 SMS_STS st;
 
@@ -185,7 +190,7 @@ static std_msgs__msg__UInt8 gnss_heading_quality_msg;
 static rcl_subscription_t sub_SERVO;
 static rcl_publisher_t pub_SERVO;
 
-static std_msgs__msg__UInt8 SERVO_req_msg;
+static my_robot_msgs__msg__ServoCmd SERVO_req_msg;
 static std_msgs__msg__Bool SERVO_resp_msg;
 
 // Led COP
@@ -205,11 +210,17 @@ static std_msgs__msg__UInt8 LIGHT_req_msg;
 static std_msgs__msg__Bool LIGHT_resp_msg;
 
 // led CAM
-static rcl_subscription_t sub_CAM;
-static rcl_publisher_t pub_CAM;
+static rcl_subscription_t sub_CAM1;
+static rcl_publisher_t pub_CAM1;
 
-static std_msgs__msg__UInt8 CAM_req_msg;
-static std_msgs__msg__Bool CAM_resp_msg;
+static std_msgs__msg__UInt8 CAM1_req_msg;
+static std_msgs__msg__Bool CAM1_resp_msg;
+
+static rcl_subscription_t sub_CAM2;
+static rcl_publisher_t pub_CAM2;
+
+static std_msgs__msg__UInt8 CAM2_req_msg;
+static std_msgs__msg__Bool CAM2_resp_msg;
 
 // led RGB
 static absolute_time_t next_led_update;
@@ -262,13 +273,13 @@ static void wiznet_init(void)
 
 void gpio_init_custom(void)
 {
-    gpio_init(_reset_pin);
-    gpio_set_dir(_reset_pin, GPIO_OUT);
-    gpio_put(_reset_pin, 1);
+    gpio_init(BNO_RST);
+    gpio_set_dir(BNO_RST, GPIO_OUT);
+    gpio_put(BNO_RST, 1);
 
-    gpio_init(_int_pin);
-    gpio_set_dir(_int_pin, GPIO_IN);
-    gpio_pull_up(_int_pin);
+    gpio_init(BNO_INT);
+    gpio_set_dir(BNO_INT, GPIO_IN);
+    gpio_pull_up(BNO_INT);
 
     gpio_init(COP_LED);
     gpio_set_dir(COP_LED, GPIO_OUT);
@@ -282,9 +293,13 @@ void gpio_init_custom(void)
     gpio_set_dir(LIGHT, GPIO_OUT);
     gpio_put(LIGHT, 0);
 
-    gpio_init(CAM);
-    gpio_set_dir(CAM, GPIO_OUT);
-    gpio_put(CAM, 0);
+    gpio_init(CAM1);
+    gpio_set_dir(CAM1, GPIO_OUT);
+    gpio_put(CAM1, 0);
+
+    gpio_init(CAM2);
+    gpio_set_dir(CAM2, GPIO_OUT);
+    gpio_put(CAM2, 0);
 
     gpio_init(PGOOD);
     gpio_set_dir(PGOOD, GPIO_IN);
@@ -299,10 +314,10 @@ void gpio_init_custom(void)
 /*********************************/
 
 // Extracción y Liberación de la Cola : Lectura
-static inline bool queue_try_get_latest(queue_t *q, void *imu)
+static inline bool queue_try_get_latest(queue_t *q, void *msg)
 {
     bool has = false;
-    while (queue_try_remove(q, imu)) {
+    while (queue_try_remove(q, msg)) {
         has = true;
     }
     return has;
@@ -332,7 +347,7 @@ static inline double nmea_degmin_to_deg(double degmin)
     return (double)deg + minutes / 60.0;
 }
 
-static bool parse_gga_line(const char *line, gnss_fix_t *imu)
+static bool parse_gga_line(const char *line, gnss_fix_t *msg)
 {
     // $GNGGA,time,lat,N/S,lon,E/W,fix,sats,hdop,alt,M,...
     if (strncmp(line, "$GNGGA,", 7) != 0 && strncmp(line, "$GPGGA,", 7) != 0) return false;
@@ -363,13 +378,11 @@ static bool parse_gga_line(const char *line, gnss_fix_t *imu)
         field++;
     }
 
-    imu->fix_q = (uint8_t)fix;
-    imu->sats  = (uint8_t)sats;
-    imu->hdop  = (float)hdop;
-    imu->alt_m = alt;
+    msg->fix_q = (uint8_t)fix;
+    msg->alt_m = alt;
 
     if (fix <= 0 || lat_dm == 0 || lon_dm == 0 || ns == 0 || ew == 0) {
-        imu->valid = false;
+        msg->valid = false;
         return true;
     }
 
@@ -378,9 +391,9 @@ static bool parse_gga_line(const char *line, gnss_fix_t *imu)
     if (ns == 'S') lat = -lat;
     if (ew == 'W') lon = -lon;
 
-    imu->lat_deg = lat;
-    imu->lon_deg = lon;
-    imu->valid = true;
+    msg->lat_deg = lat;
+    msg->lon_deg = lon;
+    msg->valid = true;
     return true;
 }
 
@@ -403,13 +416,13 @@ static uint8_t heading_quality_from_sol(const char *sol)
     if (!sol) return 0;
     if (strcmp(sol, "NARROW_INT") == 0)   return 4; // mejor
     if (strcmp(sol, "NARROW_FLOAT") == 0) return 3;
-    if (strcmp(sol, "FLOAT") == 0 || strcmp(sol, "L1_FLOAT") == 0 || strcmp(sol, "NARROW_FLOAT") == 0) return 2;
+    if (strcmp(sol, "FLOAT") == 0 || strcmp(sol, "L1_FLOAT") == 0) return 2;
     if (strcmp(sol, "SINGLE") == 0)       return 1;
     if (strcmp(sol, "NONE") == 0)         return 0;
-    return 1;
+    return 0;
 }
 
-static bool parse_headingga_line(const char *line, gnss_heading_t *imu)
+static bool parse_headingga_line(const char *line, gnss_heading_t *msg)
 {
     if (strncmp(line, "#UNIHEADINGA,", 12) != 0 && strncmp(line, "#HEADINGA,", 9) != 0) {
         return false;
@@ -463,20 +476,20 @@ static bool parse_headingga_line(const char *line, gnss_heading_t *imu)
     float half = 0.5f * heading * 0.017453292519943295f;
 
     float yaw_rad = deg2radf(heading);
-    quat_from_yaw(yaw_rad, &imu->qx, &imu->qy, &imu->qz, &imu->qw);
+    quat_from_yaw(yaw_rad, &msg->qx, &msg->qy, &msg->qz, &msg->qw);
 
     float yaw_std_rad = deg2radf(hstd);
-    imu->yaw_var = yaw_std_rad * yaw_std_rad;
+    msg->yaw_var = yaw_std_rad * yaw_std_rad;
 
-    imu->valid = true;
-    imu->quality = heading_quality_from_sol(sol);
+    msg->valid = true;
+    msg->quality = heading_quality_from_sol(sol);
 
-    if (status && (strncmp(status, "INSUFFICIENT_OBS", 16) == 0)) imu->valid = false;
-    if (sol && strcmp(sol, "NONE") == 0) imu->valid = false;
+    if (status && (strncmp(status, "INSUFFICIENT_OBS", 16) == 0)) msg->valid = false;
+    if (sol && strcmp(sol, "NONE") == 0) msg->valid = false;
 
-    if (!imu->valid) {
-    imu->yaw_var = 99999.0f;
-    imu->qx = 0.0f; imu->qy = 0.0f; imu->qz = 0.0f; imu->qw = 1.0f;
+    if (!msg->valid) {
+    msg->yaw_var = 99999.0f;
+    msg->qx = 0.0f; msg->qy = 0.0f; msg->qz = 0.0f; msg->qw = 1.0f;
     }
 
     return true;
@@ -496,13 +509,17 @@ static int8_t navsat_status_from_fixq(uint8_t fixq)
 //Callback Servo
 void subscription_callback_servo(const void * msgin)
 {
-  const std_msgs__msg__UInt8 * msg = (const std_msgs__msg__UInt8 *)msgin;
+  const my_robot_msgs__msg__ServoCmd * msg = (const my_robot_msgs__msg__ServoCmd *)msgin;
   
-  SERVO_resp_msg.data = false;
-  uint8_t a = msg->data;
+  servo_t servo;
 
-  if (a <= 180) {
-    queue_push_latest(&q_servo, &a, &servo_old);
+  SERVO_resp_msg.data = false;
+
+  servo.id = msg->id;
+  servo.angle = msg->angle;
+
+  if (servo.angle <= 180) {
+    queue_push_latest(&q_servo, &servo, &servo_old);
     SERVO_resp_msg.data = true;
   }
 
@@ -578,20 +595,36 @@ void subscription_callback_light(const void * msgin)
 }
 
 // Callback CAM
-void subscription_callback_cam(const void * msgin)
+void subscription_callback_cam1(const void * msgin)
 {
   const std_msgs__msg__UInt8 * msg = (const std_msgs__msg__UInt8 *)msgin;
   
-  CAM_resp_msg.data = false;
+  CAM1_resp_msg.data = false;
 
   if (msg->data) {
-    gpio_put(CAM, 1);
-    CAM_resp_msg.data = true;
+    gpio_put(CAM1, 1);
+    CAM1_resp_msg.data = true;
   } else {
-    gpio_put(CAM, 0);
-    CAM_resp_msg.data = true;
+    gpio_put(CAM1, 0);
+    CAM1_resp_msg.data = true;
   }
-  RCCONTINUE(rcl_publish(&pub_CAM, &CAM_resp_msg, NULL));
+  RCCONTINUE(rcl_publish(&pub_CAM1, &CAM1_resp_msg, NULL));
+}
+
+void subscription_callback_cam2(const void * msgin)
+{
+  const std_msgs__msg__UInt8 * msg = (const std_msgs__msg__UInt8 *)msgin;
+  
+  CAM2_resp_msg.data = false;
+
+  if (msg->data) {
+    gpio_put(CAM2, 1);
+    CAM2_resp_msg.data = true;
+  } else {
+    gpio_put(CAM2, 0);
+    CAM2_resp_msg.data = true;
+  }
+  RCCONTINUE(rcl_publish(&pub_CAM2, &CAM2_resp_msg, NULL));
 }
 
 // Función Led RGB
@@ -611,9 +644,9 @@ void core1_entry(void)
     i2c_inst_t* i2c_port = i2c1;
     initI2C(i2c_port, false);
 
-    gpio_put(_reset_pin, 0);
+    gpio_put(BNO_RST, 0);
     sleep_ms(10);
-    gpio_put(_reset_pin, 1);
+    gpio_put(BNO_RST, 1);
     sleep_ms(100);
 
     while (!IMU.begin(0x4B, i2c_port)) {
@@ -696,10 +729,12 @@ void core1_entry(void)
 
         // SERVO
         if (queue_try_get_latest(&q_servo, &servo_latest)) {
-            uint8_t angle = servo_latest;
+            uint8_t id = servo_latest.id;
+            uint8_t angle = servo_latest.angle;
+
             uint16_t pos = (uint16_t)(angle*512.0/45.0+1024.0);
 
-            st.WritePosEx(SERVO_ID, pos, SERVO_SPEED, SERVO_ACC);
+            st.WritePosEx(id, pos, SERVO_SPEED, SERVO_ACC);
         }
         tight_loop_contents();
     }
@@ -748,11 +783,12 @@ int main(void)
 
             brillo = !brillo;
 
-            change_led_rgb(&ledStrip, brillo * 200, 0, 0);
+            change_led_rgb(&ledStrip, brillo * 250, 0, 0);
         }
     }
 
-    change_led_rgb(&ledStrip, 0, 200, 0);
+    change_led_rgb(&ledStrip, 255, 255, 0);
+    sleep_ms(1500);
 
     // Configuración Pines
     gpio_init_custom();
@@ -777,7 +813,7 @@ int main(void)
     queue_init(&q_imu,  sizeof(imu_t),  8);
     queue_init(&q_gnss, sizeof(gnss_fix_t),  8);
     queue_init(&q_gnss_heading, sizeof(gnss_heading_t), 8);
-    queue_init(&q_servo, sizeof(uint8_t), 8);
+    queue_init(&q_servo, sizeof(servo_t), 8);
 
     multicore_launch_core1(core1_entry);
 
@@ -805,7 +841,7 @@ int main(void)
     RCABORT(rclc_publisher_init_default(&pub_gnss_heading_quality, &node, type_support_pub_gnss_heading_quality, "gnss/heading_quality"));
 
     // Configuración SERVO
-    const rosidl_message_type_support_t * type_support_sub_servo = ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, UInt8);
+    const rosidl_message_type_support_t * type_support_sub_servo = ROSIDL_GET_MSG_TYPE_SUPPORT(my_robot_msgs, msg, ServoCmd);
     RCABORT(rclc_subscription_init_default(&sub_SERVO, &node, type_support_sub_servo, "servo/req"));
 
     const rosidl_message_type_support_t * type_support_pub_servo = ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Bool);
@@ -826,11 +862,17 @@ int main(void)
     RCABORT(rclc_publisher_init_default(&pub_LIGHT, &node, type_support_pub_light, "led_light/resp"));
 
     // Configuración CAM
-    const rosidl_message_type_support_t * type_support_sub_cam = ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, UInt8);
-    RCABORT(rclc_subscription_init_default(&sub_CAM, &node, type_support_sub_cam, "led_cam/req"));
+    const rosidl_message_type_support_t * type_support_sub_cam1 = ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, UInt8);
+    RCABORT(rclc_subscription_init_default(&sub_CAM1, &node, type_support_sub_cam1, "led_cam1/req"));
 
-    const rosidl_message_type_support_t * type_support_pub_cam = ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Bool);
-    RCABORT(rclc_publisher_init_default(&pub_CAM, &node, type_support_pub_cam, "led_cam/resp"));
+    const rosidl_message_type_support_t * type_support_pub_cam1 = ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Bool);
+    RCABORT(rclc_publisher_init_default(&pub_CAM1, &node, type_support_pub_cam1, "led_cam1/resp"));
+
+    const rosidl_message_type_support_t * type_support_sub_cam2 = ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, UInt8);
+    RCABORT(rclc_subscription_init_default(&sub_CAM2, &node, type_support_sub_cam2, "led_cam2/req"));
+
+    const rosidl_message_type_support_t * type_support_pub_cam2 = ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Bool);
+    RCABORT(rclc_publisher_init_default(&pub_CAM2, &node, type_support_pub_cam2, "led_cam2/resp"));
 
     // Incialización mensajes
     sensor_msgs__msg__Imu__init(&imu_msg);
@@ -838,14 +880,16 @@ int main(void)
     std_msgs__msg__UInt8__init(&gnss_quality_msg);
     sensor_msgs__msg__Imu__init(&gnss_heading_msg);    
     std_msgs__msg__UInt8__init(&gnss_heading_quality_msg);
-    std_msgs__msg__UInt8__init(&SERVO_req_msg);
+    my_robot_msgs__msg__ServoCmd__init(&SERVO_req_msg);
     std_msgs__msg__Bool__init(&SERVO_resp_msg);
     std_msgs__msg__UInt8__init(&COP_req_msg);
     std_msgs__msg__Bool__init(&COP_resp_msg);
     std_msgs__msg__UInt8__init(&LIGHT_req_msg);  
     std_msgs__msg__Bool__init(&LIGHT_resp_msg);
-    std_msgs__msg__UInt8__init(&CAM_req_msg);
-    std_msgs__msg__Bool__init(&CAM_resp_msg);
+    std_msgs__msg__UInt8__init(&CAM1_req_msg);
+    std_msgs__msg__Bool__init(&CAM1_resp_msg);
+    std_msgs__msg__UInt8__init(&CAM2_req_msg);
+    std_msgs__msg__Bool__init(&CAM2_resp_msg);
 
     // Configuración campos constantes mensajes
 
@@ -866,11 +910,12 @@ int main(void)
     // Configuración Executor
     rclc_executor_t executor;
     executor = rclc_executor_get_zero_initialized_executor();
-    unsigned int num_handles = 4;
+    unsigned int num_handles = 5;
     RCABORT(rclc_executor_init(&executor, &support.context, num_handles, &allocator));
     RCABORT(rclc_executor_add_subscription(&executor, &sub_COP, &COP_req_msg, &subscription_callback_cop, ON_NEW_DATA));
     RCABORT(rclc_executor_add_subscription(&executor, &sub_LIGHT, &LIGHT_req_msg, &subscription_callback_light, ON_NEW_DATA));
-    RCABORT(rclc_executor_add_subscription(&executor, &sub_CAM, &CAM_req_msg, &subscription_callback_cam, ON_NEW_DATA));
+    RCABORT(rclc_executor_add_subscription(&executor, &sub_CAM1, &CAM1_req_msg, &subscription_callback_cam1, ON_NEW_DATA));
+    RCABORT(rclc_executor_add_subscription(&executor, &sub_CAM2, &CAM2_req_msg, &subscription_callback_cam2, ON_NEW_DATA));
     RCABORT(rclc_executor_add_subscription(&executor, &sub_SERVO, &SERVO_req_msg, &subscription_callback_servo, ON_NEW_DATA));
     rclc_executor_set_timeout(&executor, RCL_MS_TO_NS(5));
 
@@ -960,6 +1005,8 @@ int main(void)
 
             if (ping_fail >= 3) {
                 printf("Agent caído -> reboot\n");
+                
+                change_led_rgb(&ledStrip, 0, 0, 250);
                 sleep_ms(20);
                 watchdog_reboot(0, 0, 0);
             }
@@ -968,22 +1015,10 @@ int main(void)
         if (absolute_time_diff_us(get_absolute_time(), next_led_update) <= 0) {
             next_led_update = make_timeout_time_ms(800);
 
-            uint8_t base = 30 + rand() % 50;
-            uint8_t low1 = rand() % 20;
-            uint8_t low2 = rand() % 20;
+            brillo = !brillo;
 
-            uint8_t r, g, b;
-            int mode = rand() % 3;
-
-            if (mode == 0) {
-                r = base; g = low1; b = low2;
-            } else if (mode == 1) {
-                r = low1; g = base; b = low2;
-            } else {
-                r = low1; g = low2; b = base;
-            }
-
-            change_led_rgb(&ledStrip, r, g, b);
+            change_led_rgb(&ledStrip, 0, brillo * 250, 0);
+        
         }
 
     }
@@ -1006,8 +1041,11 @@ int main(void)
     rcl_publisher_fini(&pub_LIGHT, &node);
     rcl_subscription_fini(&sub_LIGHT, &node);
 
-    rcl_publisher_fini(&pub_CAM, &node);
-    rcl_subscription_fini(&sub_CAM, &node);
+    rcl_publisher_fini(&pub_CAM1, &node);
+    rcl_subscription_fini(&sub_CAM1, &node);
+
+    rcl_publisher_fini(&pub_CAM2, &node);
+    rcl_subscription_fini(&sub_CAM2, &node);
 
     rcl_node_fini(&node);
     rclc_support_fini(&support);
