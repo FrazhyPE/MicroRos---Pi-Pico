@@ -168,6 +168,7 @@ static rcl_node_t node;
 // Agente ROS
 static absolute_time_t next_ping;
 static uint8_t ping_fail = 0;
+static absolute_time_t next_sync;
 
 // IMU
 static rcl_publisher_t pub_imu;
@@ -333,13 +334,6 @@ static inline void queue_push_latest(queue_t *q, const void *elem, void *scratch
 }
 
 // GNSS
-static inline void stamp_from_us(builtin_interfaces__msg__Time *t, uint64_t us)
-{
-    uint64_t ns = us * 1000ULL;
-    t->sec = (int32_t)(ns / 1000000000ULL);
-    t->nanosec = (uint32_t)(ns % 1000000000ULL);
-}
-
 static inline double nmea_degmin_to_deg(double degmin)
 {
     int deg = (int)(degmin / 100.0);
@@ -502,6 +496,18 @@ static int8_t navsat_status_from_fixq(uint8_t fixq)
     return 0;
 }
 
+static inline bool stamp_from_ros_time(builtin_interfaces__msg__Time *t)
+{
+    if (!rmw_uros_epoch_synchronized()) {
+        return false;
+    }
+
+    int64_t ns = rmw_uros_epoch_nanos();
+    t->sec = (int32_t)(ns / 1000000000LL);
+    t->nanosec = (uint32_t)(ns % 1000000000LL);
+    return true;
+}
+
 /*********************************/
 /*    Callbacks Timer y Subs     */
 /*********************************/
@@ -660,8 +666,8 @@ void core1_entry(void)
     imu_t imu = {0};
 
     // Inicialización GNSS
-    gnss_fix_t gnss;
-    gnss_heading_t gnss_heading;
+    gnss_fix_t gnss = {0};
+    gnss_heading_t gnss_heading = {0};
 
     // Inicialización Servo
     uint8_t sid;
@@ -671,6 +677,31 @@ void core1_entry(void)
 
     while (true)
     {   
+        // GNSS
+        while (uart_is_readable(GNSS_UART)) {
+            char c = (char)uart_getc(GNSS_UART);
+
+            if (c == '\r') continue;
+
+            if (c == '\n') {
+                line[idx] = 0;
+                idx = 0;
+
+                if (line[0] == '$') {
+                    if (parse_gga_line(line, &gnss)) {
+                        queue_push_latest(&q_gnss, &gnss, &gnss_old);
+                    }
+                } else if (line[0] == '#') {
+                    if (parse_headingga_line(line, &gnss_heading)) {
+                        queue_push_latest(&q_gnss_heading, &gnss_heading, &gnss_heading_old);
+                    }
+                }
+            } else {
+                if (idx < (int)sizeof(line) - 1) line[idx++] = c;
+                else idx = 0;
+            }
+        }
+
         // IMU
         bool got_rv = false;
         while (IMU.getSensorEvent()) {
@@ -701,31 +732,6 @@ void core1_entry(void)
             }
         }
         if (got_rv) queue_push_latest(&q_imu, &imu, &imu_old);
-
-        // GNSS
-        while (uart_is_readable(GNSS_UART)) {
-            char c = (char)uart_getc(GNSS_UART);
-
-            if (c == '\r') continue;
-
-            if (c == '\n') {
-                line[idx] = 0;
-                idx = 0;
-
-                if (line[0] == '$') {
-                    if (parse_gga_line(line, &gnss)) {
-                        queue_push_latest(&q_gnss, &gnss, &gnss_old);
-                    }
-                } else if (line[0] == '#') {
-                    if (parse_headingga_line(line, &gnss_heading)) {
-                        queue_push_latest(&q_gnss_heading, &gnss_heading, &gnss_heading_old);
-                    }
-                }
-            } else {
-                if (idx < (int)sizeof(line) - 1) line[idx++] = c;
-                else idx = 0;
-            }
-        }
 
         // SERVO
         if (queue_try_get_latest(&q_servo, &servo_latest)) {
@@ -768,6 +774,7 @@ int main(void)
     );
     
     next_ping = make_timeout_time_ms(500);
+    next_sync = make_timeout_time_ms(30000);
     next_led  = make_timeout_time_ms(300);
 
     while (rmw_uros_ping_agent(100, 1) != RCL_RET_OK) {
@@ -822,6 +829,18 @@ int main(void)
     rclc_support_t support;
     RCABORT(rclc_support_init(&support, 0, NULL, &allocator));
     RCABORT(rclc_node_init_default(&node, "node", "pico", &support));
+
+    bool time_synced = false;
+
+    while (!time_synced) {
+        if (rmw_uros_sync_session(200) == RMW_RET_OK) {
+            time_synced = true;
+            printf("Time sync: OK\n");
+        } else {
+            printf("Time sync: FAILED, reintentando...\n");
+            sleep_ms(200);
+        }
+    }
 
     // Configuración IMU
     const rosidl_message_type_support_t * type_support_pub_imu = ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, Imu);
@@ -900,7 +919,7 @@ int main(void)
     imu_msg.linear_acceleration_covariance[0] = -1;
 
     // GNSS
-    rosidl_runtime_c__String__assign(&gnss_msg.header.frame_id, "gnss");
+    rosidl_runtime_c__String__assign(&gnss_msg.header.frame_id, "gnss_link");
     gnss_msg.position_covariance_type = sensor_msgs__msg__NavSatFix__COVARIANCE_TYPE_UNKNOWN;
 
     rosidl_runtime_c__String__assign(&gnss_heading_msg.header.frame_id, "gnss_heading");
@@ -922,7 +941,6 @@ int main(void)
     next_ping = make_timeout_time_ms(1000);
     next_led_update = make_timeout_time_ms(500);
     ping_fail = 0;
-    uint64_t now_us;
     
     // Publicación Topics
     while (true)
@@ -930,62 +948,60 @@ int main(void)
         rclc_executor_spin_some(&executor, RCL_MS_TO_NS(1));
 
         if (queue_try_get_latest(&q_imu, &imu_latest)) {
-            now_us = time_us_64();
-            stamp_from_us(&imu_msg.header.stamp, now_us);
+            if (stamp_from_ros_time(&imu_msg.header.stamp)) {
+                imu_msg.orientation.x = imu_latest.qx;
+                imu_msg.orientation.y = imu_latest.qy;
+                imu_msg.orientation.z = imu_latest.qz;
+                imu_msg.orientation.w = imu_latest.qw;
 
-            imu_msg.orientation.x = imu_latest.qx;
-            imu_msg.orientation.y = imu_latest.qy;
-            imu_msg.orientation.z = imu_latest.qz;
-            imu_msg.orientation.w = imu_latest.qw;
+                imu_msg.angular_velocity.x = imu_latest.gx;
+                imu_msg.angular_velocity.y = imu_latest.gy;
+                imu_msg.angular_velocity.z = imu_latest.gz;
 
-            imu_msg.angular_velocity.x = imu_latest.gx;
-            imu_msg.angular_velocity.y = imu_latest.gy;
-            imu_msg.angular_velocity.z = imu_latest.gz;
+                imu_msg.linear_acceleration.x = imu_latest.ax;
+                imu_msg.linear_acceleration.y = imu_latest.ay;
+                imu_msg.linear_acceleration.z = imu_latest.az;
 
-            imu_msg.linear_acceleration.x = imu_latest.ax;
-            imu_msg.linear_acceleration.y = imu_latest.ay;
-            imu_msg.linear_acceleration.z = imu_latest.az;
-
-            RCCONTINUE(rcl_publish(&pub_imu, &imu_msg, NULL));
+                RCCONTINUE(rcl_publish(&pub_imu, &imu_msg, NULL));
+            }
         }
 
         if (queue_try_get_latest(&q_gnss, &gnss_latest)) {
-            now_us = time_us_64();
-            stamp_from_us(&gnss_msg.header.stamp, now_us);
-
-            gnss_msg.latitude  = gnss_latest.lat_deg;
-            gnss_msg.longitude = gnss_latest.lon_deg;
-            gnss_msg.altitude  = gnss_latest.alt_m;
+            if (stamp_from_ros_time(&gnss_msg.header.stamp)) {
+                gnss_msg.latitude  = gnss_latest.lat_deg;
+                gnss_msg.longitude = gnss_latest.lon_deg;
+                gnss_msg.altitude  = gnss_latest.alt_m;
             
-            gnss_quality_msg.data = gnss_latest.fix_q;
-            gnss_msg.status.status  = navsat_status_from_fixq(gnss_latest.fix_q);
-            gnss_msg.status.service = 1 | 2 | 4 | 8;
+                gnss_quality_msg.data = gnss_latest.fix_q;
+                gnss_msg.status.status  = navsat_status_from_fixq(gnss_latest.fix_q);
+                gnss_msg.status.service = 1 | 2 | 4 | 8;
 
-            if (!gnss_latest.valid) {
-            gnss_msg.status.status = -1;
+                if (!gnss_latest.valid) {
+                gnss_msg.status.status = -1;
+                }
+
+                RCCONTINUE(rcl_publish(&pub_gnss, &gnss_msg, NULL));
+                RCCONTINUE(rcl_publish(&pub_gnss_quality, &gnss_quality_msg, NULL));
             }
-
-            RCCONTINUE(rcl_publish(&pub_gnss, &gnss_msg, NULL));
-            RCCONTINUE(rcl_publish(&pub_gnss_quality, &gnss_quality_msg, NULL));
         }
 
         if (queue_try_get_latest(&q_gnss_heading, &gnss_heading_latest)) {
-            now_us = time_us_64();
-            stamp_from_us(&gnss_heading_msg.header.stamp, now_us);
+            if (stamp_from_ros_time(&gnss_heading_msg.header.stamp)) {
 
-            gnss_heading_msg.orientation.x = gnss_heading_latest.qx;
-            gnss_heading_msg.orientation.y = gnss_heading_latest.qy;
-            gnss_heading_msg.orientation.z = gnss_heading_latest.qz;
-            gnss_heading_msg.orientation.w = gnss_heading_latest.qw;
+                gnss_heading_msg.orientation.x = gnss_heading_latest.qx;
+                gnss_heading_msg.orientation.y = gnss_heading_latest.qy;
+                gnss_heading_msg.orientation.z = gnss_heading_latest.qz;
+                gnss_heading_msg.orientation.w = gnss_heading_latest.qw;
 
-            gnss_heading_msg.orientation_covariance[0] = 99999.0;
-            gnss_heading_msg.orientation_covariance[4] = 99999.0;
-            gnss_heading_msg.orientation_covariance[8] = gnss_heading_latest.yaw_var;
-            
-            gnss_heading_quality_msg.data = gnss_heading_latest.quality;
+                gnss_heading_msg.orientation_covariance[0] = 99999.0;
+                gnss_heading_msg.orientation_covariance[4] = 99999.0;
+                gnss_heading_msg.orientation_covariance[8] = gnss_heading_latest.yaw_var;
+                
+                gnss_heading_quality_msg.data = gnss_heading_latest.quality;
 
-            RCCONTINUE(rcl_publish(&pub_gnss_heading, &gnss_heading_msg, NULL));
-            RCCONTINUE(rcl_publish(&pub_gnss_heading_quality, &gnss_heading_quality_msg, NULL));
+                RCCONTINUE(rcl_publish(&pub_gnss_heading, &gnss_heading_msg, NULL));
+                RCCONTINUE(rcl_publish(&pub_gnss_heading_quality, &gnss_heading_quality_msg, NULL));
+            }
         }
         
         if (absolute_time_diff_us(get_absolute_time(), next_ping) <= 0){
@@ -1009,6 +1025,16 @@ int main(void)
                 change_led_rgb(&ledStrip, 0, 0, 250);
                 sleep_ms(20);
                 watchdog_reboot(0, 0, 0);
+            }
+        }
+
+        if (absolute_time_diff_us(get_absolute_time(), next_sync) <= 0){
+            next_sync = make_timeout_time_ms(30000);
+
+            if (rmw_uros_sync_session(100) == RMW_RET_OK) {
+                printf("Time re-sync OK\n");
+            } else {
+                printf("Time re-sync FAIL\n");
             }
         }
 
