@@ -45,6 +45,12 @@ extern "C" {
 #include "pico/stdlib.h"
 #include "WS2812.hpp"
 
+#include <stdio.h>
+#include <unistd.h>
+#include <math.h>
+#include <string.h>
+#include <stdlib.h>
+
 #define RCABORT(fn) do {rcl_ret_t rc = fn; if(rc != RCL_RET_OK){ printf("Error en la línea %d: %d. Abortando...\n",__LINE__,(int)rc); sleep_ms(1000); watchdog_reboot(0,0,0);}} while (0)
 #define RCCONTINUE(fn) do {rcl_ret_t rc = fn; if(rc != RCL_RET_OK){ printf("Error en la línea %d: %d. Continuando...\n",__LINE__,(int)rc);}} while (0)
 
@@ -69,6 +75,23 @@ extern "C" {
 
 #define LED_LENGTH 1
 
+static volatile uint32_t gnss_bytes_rx = 0;
+
+static uint32_t gnss_lines_total = 0;
+static uint32_t gnss_gga_lines = 0;
+static uint32_t gnss_gst_lines = 0;
+static uint32_t gnss_heading_lines = 0;
+static uint32_t gnss_other_lines = 0;
+static uint32_t gnss_line_overlong = 0;
+static int gnss_max_line_len = 0;
+
+#define GNSS_RING_SIZE 4096
+
+static volatile uint8_t gnss_ring[GNSS_RING_SIZE];
+static volatile uint16_t gnss_head = 0;
+static volatile uint16_t gnss_tail = 0;
+static volatile uint32_t gnss_overflow = 0;
+
 /*********************************/
 /*          Estructuras          */
 /*********************************/
@@ -90,19 +113,26 @@ typedef struct {
     double lat_deg;
     double lon_deg;
     double alt_m;
-    uint8_t fix_q;
-    bool valid;
-} gnss_fix_t;
+    uint8_t fix_quality;
+    bool valid_coords;
 
-typedef struct {
+    double cov_north;
+    double cov_east;
+    double cov_up;
+    bool valid_cov;
+
     float qx;
     float qy;
     float qz;
     float qw;
     float yaw_var;
-    bool valid;
-    uint8_t quality;
-} gnss_heading_t;
+    float pitch_var;
+    float yaw_deg;
+    float pitch_deg;
+    char heading_status[20];
+    char heading_sol[20];
+    bool valid_heading;
+} gnss_t;
 
 typedef struct {
     uint8_t id;
@@ -136,7 +166,6 @@ const uint CURRENT = 28;
 
 static queue_t q_imu;
 static queue_t q_gnss;
-static queue_t q_gnss_heading;
 static queue_t q_servo;
 
 // IMU
@@ -146,11 +175,8 @@ imu_t imu_latest;
 static BNO08x IMU;
 
 // GNSS
-gnss_fix_t gnss_old;
-gnss_fix_t gnss_latest;
-
-gnss_heading_t gnss_heading_old;
-gnss_heading_t gnss_heading_latest;
+gnss_t gnss_old;
+gnss_t gnss_latest;
 
 // SERVO
 servo_t servo_old;
@@ -334,16 +360,20 @@ static inline void queue_push_latest(queue_t *q, const void *elem, void *scratch
 }
 
 // GNSS
-static inline double nmea_degmin_to_deg(double degmin)
+
+    // GNGGA
+
+static inline double nmea_deg(double degmin)
 {
     int deg = (int)(degmin / 100.0);
     double minutes = degmin - (double)deg * 100.0;
     return (double)deg + minutes / 60.0;
 }
 
-static bool parse_gga_line(const char *line, gnss_fix_t *msg)
+static bool parse_gga_line(const char *line, gnss_t *msg)
 {
-    // $GNGGA,time,lat,N/S,lon,E/W,fix,sats,hdop,alt,M,...
+    msg -> valid_coords = false;
+
     if (strncmp(line, "$GNGGA,", 7) != 0 && strncmp(line, "$GPGGA,", 7) != 0) return false;
 
     char buf[200];
@@ -352,72 +382,91 @@ static bool parse_gga_line(const char *line, gnss_fix_t *msg)
 
     char *save = NULL;
     char *tok = strtok_r(buf, ",", &save);
-    int field = 0;
 
-    double lat_dm = 0, lon_dm = 0, alt = 0, hdop = 0;
+    double lat = 0, lon = 0, alt = 0;
     char ns = 0, ew = 0;
-    int fix = 0, sats = 0;
+    int fix = 0;
 
+    int field = 1;
     while (tok) {
-        if (field == 2 && tok[0]) lat_dm = atof(tok);
-        if (field == 3 && tok[0]) ns = tok[0];
-        if (field == 4 && tok[0]) lon_dm = atof(tok);
-        if (field == 5 && tok[0]) ew = tok[0];
-        if (field == 6 && tok[0]) fix = atoi(tok);
-        if (field == 7 && tok[0]) sats = atoi(tok);
-        if (field == 8 && tok[0]) hdop = atof(tok);
-        if (field == 9 && tok[0]) alt = atof(tok);
+        if (field == 3 && tok[0]) lat = atof(tok);
+        if (field == 4 && tok[0]) ns = tok[0];
+        if (field == 5 && tok[0]) lon = atof(tok);
+        if (field == 6 && tok[0]) ew = tok[0];
+
+        if (field == 7 && tok[0]) fix = atoi(tok);
+        if (field == 10 && tok[0]) alt = atof(tok);
 
         tok = strtok_r(NULL, ",", &save);
         field++;
     }
 
-    msg->fix_q = (uint8_t)fix;
-    msg->alt_m = alt;
-
-    if (fix <= 0 || lat_dm == 0 || lon_dm == 0 || ns == 0 || ew == 0) {
-        msg->valid = false;
+    if (fix <= 0 || lat == 0 || lon == 0 || ns == 0 || ew == 0) {
         return true;
     }
 
-    double lat = nmea_degmin_to_deg(lat_dm);
-    double lon = nmea_degmin_to_deg(lon_dm);
+    lat = nmea_deg(lat);
+    lon = nmea_deg(lon);
     if (ns == 'S') lat = -lat;
     if (ew == 'W') lon = -lon;
 
-    msg->lat_deg = lat;
-    msg->lon_deg = lon;
-    msg->valid = true;
+    msg -> lat_deg = lat;
+    msg -> lon_deg = lon;
+    msg -> alt_m = alt;
+    msg -> fix_quality = (uint8_t)fix;
+    msg -> valid_coords = true;
+
     return true;
 }
 
-static inline float deg2radf(float deg)
+static int8_t navsat_status(uint8_t fixq)
 {
-    return deg * 0.017453292519943295f;
+    if (fixq == 1 || fixq == 2) return 0;
+    if (fixq == 4 || fixq == 5) return 2;
+    return -1;
 }
 
-static inline void quat_from_yaw(float yaw_rad, float *qx, float *qy, float *qz, float *qw)
+    // UNIHEADINGA
+
+static inline float deg2rad(float angle)
 {
-    float half = 0.5f * yaw_rad;
-    *qx = 0.0f;
-    *qy = 0.0f;
-    *qz = sinf(half);
-    *qw = cosf(half);
+    return angle * 0.017453292519943295f;
 }
 
-static uint8_t heading_quality_from_sol(const char *sol)
+static void quat_from_rpy(float roll, float pitch, float yaw,
+                          float *qx, float *qy, float *qz, float *qw)
 {
-    if (!sol) return 0;
-    if (strcmp(sol, "NARROW_INT") == 0)   return 4; // mejor
-    if (strcmp(sol, "NARROW_FLOAT") == 0) return 3;
-    if (strcmp(sol, "FLOAT") == 0 || strcmp(sol, "L1_FLOAT") == 0) return 2;
-    if (strcmp(sol, "SINGLE") == 0)       return 1;
-    if (strcmp(sol, "NONE") == 0)         return 0;
-    return 0;
+    float cy = cosf(yaw * 0.5f);
+    float sy = sinf(yaw * 0.5f);
+    float cp = cosf(pitch * 0.5f);
+    float sp = sinf(pitch * 0.5f);
+    float cr = cosf(roll * 0.5f);
+    float sr = sinf(roll * 0.5f);
+
+    *qw = cr * cp * cy + sr * sp * sy;
+    *qx = sr * cp * cy - cr * sp * sy;
+    *qy = cr * sp * cy + sr * cp * sy;
+    *qz = cr * cp * sy - sr * sp * cy;
 }
 
-static bool parse_headingga_line(const char *line, gnss_heading_t *msg)
+static bool parse_headingga_line(const char *line, gnss_t *msg)
 {
+    msg->valid_heading = false;
+
+    msg->qx = 0.0f;
+    msg->qy = 0.0f;
+    msg->qz = 0.0f;
+    msg->qw = 1.0f;
+
+    msg->yaw_deg = 0.0f;
+    msg->pitch_deg = 0.0f;
+
+    msg->yaw_var = 99999.0f;
+    msg->pitch_var = 99999.0f;
+
+    msg->heading_status[0] = '\0';
+    msg->heading_sol[0] = '\0';
+
     if (strncmp(line, "#UNIHEADINGA,", 12) != 0 && strncmp(line, "#HEADINGA,", 9) != 0) {
         return false;
     }
@@ -432,68 +481,115 @@ static bool parse_headingga_line(const char *line, gnss_heading_t *msg)
     char *save = NULL;
     char *tok = strtok_r(buf, ",", &save);
 
-    // Esperado:
-    // tok0 = SOL_COMPUTED  (o INSUFFICIENT_OBS, etc.)
-    // tok1 = NARROW_FLOAT / NARROW_INT / NONE / ...
-    // tok2 = baseline_m
-    // tok3 = heading_deg
-    // tok4 = pitch_deg
-    // tok5 = reserved (a veces 0.0000)
-    // tok6 = heading_std
-    // tok7 = pitch_std
-    const char *status = NULL;
-    const char *sol = NULL;
-
+    const char *status = NULL; const char *sol = NULL;
     float baseline = 0, heading = 0, pitch = 0, hstd = 0, pstd = 0;
 
-    int field = 0;
+    int field = 2;
     while (tok) {
-        // tok puede venir con \r al final
         size_t n = strlen(tok);
         if (n && tok[n-1] == '\r') tok[n-1] = 0;
 
-        if (field == 0) status = tok;
-        else if (field == 1) sol = tok;
-        else if (field == 2 && tok[0]) baseline = (float)atof(tok);
-        else if (field == 3 && tok[0]) heading  = (float)atof(tok);
-        else if (field == 4 && tok[0]) pitch    = (float)atof(tok);
-        else if (field == 6 && tok[0]) hstd     = (float)atof(tok);
-        else if (field == 7 && tok[0]) pstd     = (float)atof(tok);
+        if (field == 2) status = tok;
+        else if (field == 3) sol = tok;
+        else if (field == 4 && tok[0]) baseline = (float)atof(tok);
+        else if (field == 5 && tok[0]) heading  = (float)atof(tok);
+        else if (field == 6 && tok[0]) pitch    = (float)atof(tok);
+        else if (field == 8 && tok[0]) hstd     = (float)atof(tok);
+        else if (field == 9 && tok[0]) pstd     = (float)atof(tok);
 
         tok = strtok_r(NULL, ",", &save);
         field++;
     }
 
-    while (heading < 0.0f) heading += 360.0f;
-    while (heading >= 360.0f) heading -= 360.0f;
-
-    float half = 0.5f * heading * 0.017453292519943295f;
-
-    float yaw_rad = deg2radf(heading);
-    quat_from_yaw(yaw_rad, &msg->qx, &msg->qy, &msg->qz, &msg->qw);
-
-    float yaw_std_rad = deg2radf(hstd);
-    msg->yaw_var = yaw_std_rad * yaw_std_rad;
-
-    msg->valid = true;
-    msg->quality = heading_quality_from_sol(sol);
-
-    if (status && (strncmp(status, "INSUFFICIENT_OBS", 16) == 0)) msg->valid = false;
-    if (sol && strcmp(sol, "NONE") == 0) msg->valid = false;
-
-    if (!msg->valid) {
-    msg->yaw_var = 99999.0f;
-    msg->qx = 0.0f; msg->qy = 0.0f; msg->qz = 0.0f; msg->qw = 1.0f;
+    if (baseline <= 0) {
+        return true;
     }
+
+    if (!status || !sol) return true;
+    if (strncmp(status, "INSUFFICIENT_OBS", 16) == 0) return true;
+    if (strcmp(sol, "NONE") == 0) return true;
+
+    float yaw_rad, yaw_std_rad, pitch_rad, pitch_std_rad;
+
+    yaw_rad = deg2rad(90.0f - heading);
+    pitch_rad = deg2rad(pitch);
+
+    yaw_std_rad = deg2rad(hstd);
+    pitch_std_rad = deg2rad(pstd);
+
+    quat_from_rpy(0.0f, pitch_rad, yaw_rad, &msg->qx, &msg->qy, &msg->qz, &msg->qw);
+
+    msg -> yaw_var = yaw_std_rad * yaw_std_rad;
+    msg -> pitch_var = pitch_std_rad * pitch_std_rad;
+    msg -> yaw_deg = 90.0f - heading;
+    msg -> pitch_deg = pitch;
+    snprintf(msg->heading_status, sizeof(msg->heading_status), "%s", status ? status : "");
+    snprintf(msg->heading_sol, sizeof(msg->heading_sol), "%s", sol ? sol : "");
+    msg -> valid_heading = true;
 
     return true;
 }
 
-static int8_t navsat_status_from_fixq(uint8_t fixq)
+static uint8_t heading_quality(const char *sol)
 {
-    if (fixq == 0) return -1;
-    if (fixq == 4 || fixq == 5) return 2;
+    if (!sol) return 0;
+    if (strcmp(sol, "NARROW_INT") == 0)   return 4;
+    if (strcmp(sol, "NARROW_FLOAT") == 0) return 3;
+    if (strcmp(sol, "FLOAT") == 0 || strcmp(sol, "L1_FLOAT") == 0) return 2;
+    if (strcmp(sol, "SINGLE") == 0)       return 1;
+    if (strcmp(sol, "NONE") == 0)         return 0;
     return 0;
+}
+
+    // GPGST
+
+static bool parse_gst_line(const char *line, gnss_t *msg)
+{
+    msg -> valid_cov = false;
+
+    if (strncmp(line, "$GPGST,", 7) != 0 && strncmp(line, "$GNGST,", 7) != 0) {
+        return false;
+    }
+
+    char buf[160];
+    strncpy(buf, line, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = 0;
+
+    char *save = NULL;
+    char *tok = strtok_r(buf, ",", &save);
+
+    int field = 1;
+
+    float lat_std = 0.0f; float lon_std = 0.0f; float alt_std = 0.0f;
+
+    while (tok) {
+        size_t n = strlen(tok);
+        if (n && tok[n - 1] == '\r') tok[n - 1] = '\0';
+
+        if (field == 7 && tok[0]) {
+            lat_std = (float)atof(tok);
+        } 
+        else if (field == 8 && tok[0]) {
+            lon_std = (float)atof(tok);
+        } 
+        else if (field == 9 && tok[0]) {
+            alt_std = (float)atof(tok);
+        }
+
+        tok = strtok_r(NULL, ",", &save);
+        field++;
+    }
+
+    if (lat_std <= 0.0f || lon_std <= 0.0f || alt_std <= 0.0f) {
+        return true;
+    }
+
+    msg -> cov_north = lat_std * lat_std;
+    msg -> cov_east = lon_std * lon_std;
+    msg -> cov_up = alt_std * alt_std;
+    msg -> valid_cov = true;
+    
+    return true;
 }
 
 static inline bool stamp_from_ros_time(builtin_interfaces__msg__Time *t)
@@ -506,6 +602,40 @@ static inline bool stamp_from_ros_time(builtin_interfaces__msg__Time *t)
     t->sec = (int32_t)(ns / 1000000000LL);
     t->nanosec = (uint32_t)(ns % 1000000000LL);
     return true;
+}
+
+static inline bool gnss_ring_push(uint8_t c)
+{
+    uint16_t next = (uint16_t)((gnss_head + 1) % GNSS_RING_SIZE);
+
+    if (next == gnss_tail) {
+        gnss_overflow++;
+        return false;
+    }
+
+    gnss_ring[gnss_head] = c;
+    gnss_head = next;
+    return true;
+}
+
+static inline bool gnss_ring_pop(uint8_t *c)
+{
+    if (gnss_tail == gnss_head) {
+        return false;
+    }
+
+    *c = gnss_ring[gnss_tail];
+    gnss_tail = (uint16_t)((gnss_tail + 1) % GNSS_RING_SIZE);
+    return true;
+}
+
+void gnss_uart_irq_handler()
+{
+    while (uart_is_readable(GNSS_UART)) {
+        uint8_t c = (uint8_t)uart_getc(GNSS_UART);
+        gnss_bytes_rx++;
+        gnss_ring_push(c);
+    }
 }
 
 /*********************************/
@@ -666,8 +796,11 @@ void core1_entry(void)
     imu_t imu = {0};
 
     // Inicialización GNSS
-    gnss_fix_t gnss = {0};
-    gnss_heading_t gnss_heading = {0};
+    gnss_t gnss = {0};
+    uint8_t c_byte;
+    static bool cycle_has_gga = false;
+    static bool cycle_has_gst = false;
+    static bool cycle_has_heading = false;
 
     // Inicialización Servo
     uint8_t sid;
@@ -678,27 +811,88 @@ void core1_entry(void)
     while (true)
     {   
         // GNSS
-        while (uart_is_readable(GNSS_UART)) {
-            char c = (char)uart_getc(GNSS_UART);
+        while (gnss_ring_pop(&c_byte)) {
+            char c = (char)c_byte;
 
-            if (c == '\r') continue;
+            if (c == '\r') {
+                continue;
+            }
 
             if (c == '\n') {
-                line[idx] = 0;
+                line[idx] = '\0';
+
+                gnss_lines_total++;
+
+                if (idx > gnss_max_line_len) {
+                    gnss_max_line_len = idx;
+                }
+
+                printf("RAW GNSS [%d]: <%s>\n", idx, line);
+
                 idx = 0;
 
                 if (line[0] == '$') {
-                    if (parse_gga_line(line, &gnss)) {
-                        queue_push_latest(&q_gnss, &gnss, &gnss_old);
+
+                    if (strncmp(line, "$GNGGA,", 7) == 0 ||
+                        strncmp(line, "$GPGGA,", 7) == 0) {
+
+                        gnss_gga_lines++;
+
+                        if (parse_gga_line(line, &gnss)) {
+                            cycle_has_gga = true;
+                        }
+
+                    } else if (strncmp(line, "$GNGST,", 7) == 0 ||
+                            strncmp(line, "$GPGST,", 7) == 0) {
+
+                        gnss_gst_lines++;
+
+                        if (parse_gst_line(line, &gnss)) {
+                            cycle_has_gst = true;
+                        }
+
+                    } else {
+                        gnss_other_lines++;
                     }
+
                 } else if (line[0] == '#') {
-                    if (parse_headingga_line(line, &gnss_heading)) {
-                        queue_push_latest(&q_gnss_heading, &gnss_heading, &gnss_heading_old);
+
+                    if (strncmp(line, "#UNIHEADINGA,", 12) == 0 ||
+                        strncmp(line, "#HEADINGA,", 9) == 0) {
+
+                        gnss_heading_lines++;
+
+                        if (parse_headingga_line(line, &gnss)) {
+                            cycle_has_heading = true;
+                        }
+
+                    } else {
+                        gnss_other_lines++;
                     }
+
+                } else {
+                    gnss_other_lines++;
                 }
+
+                if (cycle_has_gga && cycle_has_gst && cycle_has_heading) {
+                    queue_push_latest(&q_gnss, &gnss, &gnss_old);
+
+                    cycle_has_gga = false;
+                    cycle_has_gst = false;
+                    cycle_has_heading = false;
+                }
+
             } else {
-                if (idx < (int)sizeof(line) - 1) line[idx++] = c;
-                else idx = 0;
+                if (idx < (int)sizeof(line) - 1) {
+                    line[idx++] = c;
+                } else {
+                    gnss_line_overlong++;
+                    idx = 0;
+
+                    cycle_has_gga = false;
+                    cycle_has_gst = false;
+                    cycle_has_heading = false;
+                }
             }
         }
 
@@ -808,6 +1002,10 @@ int main(void)
     uart_set_format(GNSS_UART, 8, 1, UART_PARITY_NONE);
     uart_set_fifo_enabled(GNSS_UART, true);
 
+    irq_set_exclusive_handler(UART1_IRQ, gnss_uart_irq_handler);
+    irq_set_enabled(UART1_IRQ, true);
+    uart_set_irq_enables(GNSS_UART, true, false);
+
     // Configuración UART para Servo
     uart_init(SERVO_UART, SERVO_BAUD);
     gpio_set_function(SERVO_TX_PIN, GPIO_FUNC_UART);
@@ -818,8 +1016,7 @@ int main(void)
 
     // Colas Core
     queue_init(&q_imu,  sizeof(imu_t),  8);
-    queue_init(&q_gnss, sizeof(gnss_fix_t),  8);
-    queue_init(&q_gnss_heading, sizeof(gnss_heading_t), 8);
+    queue_init(&q_gnss, sizeof(gnss_t),  8);
     queue_init(&q_servo, sizeof(servo_t), 8);
 
     multicore_launch_core1(core1_entry);
@@ -848,16 +1045,16 @@ int main(void)
 
     // Configuración GNSS
     const rosidl_message_type_support_t * type_support_pub_gnss = ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, NavSatFix);
-    RCABORT(rclc_publisher_init_default(&pub_gnss, &node, type_support_pub_gnss, "gnss/fix"));
+    RCABORT(rclc_publisher_init_best_effort(&pub_gnss, &node, type_support_pub_gnss, "gnss/fix"));
 
     const rosidl_message_type_support_t * type_support_pub_gnss_quality = ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, UInt8);
-    RCABORT(rclc_publisher_init_default(&pub_gnss_quality, &node, type_support_pub_gnss_quality, "gnss/fix_quality"));
+    RCABORT(rclc_publisher_init_best_effort(&pub_gnss_quality, &node, type_support_pub_gnss_quality, "gnss/fix_quality"));
 
     const rosidl_message_type_support_t * type_support_pub_gnss_heading = ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, Imu);
-    RCABORT(rclc_publisher_init_default(&pub_gnss_heading, &node, type_support_pub_gnss_heading, "gnss/heading"));
+    RCABORT(rclc_publisher_init_best_effort(&pub_gnss_heading, &node, type_support_pub_gnss_heading, "gnss/heading"));
 
     const rosidl_message_type_support_t * type_support_pub_gnss_heading_quality = ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, UInt8);
-    RCABORT(rclc_publisher_init_default(&pub_gnss_heading_quality, &node, type_support_pub_gnss_heading_quality, "gnss/heading_quality"));
+    RCABORT(rclc_publisher_init_best_effort(&pub_gnss_heading_quality, &node, type_support_pub_gnss_heading_quality, "gnss/heading_quality"));
 
     // Configuración SERVO
     const rosidl_message_type_support_t * type_support_sub_servo = ROSIDL_GET_MSG_TYPE_SUPPORT(my_robot_msgs, msg, ServoCmd);
@@ -922,9 +1119,12 @@ int main(void)
     rosidl_runtime_c__String__assign(&gnss_msg.header.frame_id, "gnss_link");
     gnss_msg.position_covariance_type = sensor_msgs__msg__NavSatFix__COVARIANCE_TYPE_UNKNOWN;
 
-    rosidl_runtime_c__String__assign(&gnss_heading_msg.header.frame_id, "gnss_heading");
+    rosidl_runtime_c__String__assign(&gnss_heading_msg.header.frame_id, "gnss_link");
     gnss_heading_msg.angular_velocity_covariance[0] = -1;
-    gnss_heading_msg.linear_acceleration_covariance[0] = -1;  
+    gnss_heading_msg.linear_acceleration_covariance[0] = -1;
+    gnss_heading_msg.orientation_covariance[0] = 99999.0;  
+    gnss_heading_msg.orientation_covariance[4] = 99999.0;
+    gnss_heading_msg.orientation_covariance[8] = 99999.0;   
 
     // Configuración Executor
     rclc_executor_t executor;
@@ -967,45 +1167,102 @@ int main(void)
         }
 
         if (queue_try_get_latest(&q_gnss, &gnss_latest)) {
-            if (stamp_from_ros_time(&gnss_msg.header.stamp)) {
-                gnss_msg.latitude  = gnss_latest.lat_deg;
-                gnss_msg.longitude = gnss_latest.lon_deg;
-                gnss_msg.altitude  = gnss_latest.alt_m;
-            
-                gnss_quality_msg.data = gnss_latest.fix_q;
-                gnss_msg.status.status  = navsat_status_from_fixq(gnss_latest.fix_q);
-                gnss_msg.status.service = 1 | 2 | 4 | 8;
 
-                if (!gnss_latest.valid) {
-                gnss_msg.status.status = -1;
+            builtin_interfaces__msg__Time stamp;
+
+            if (stamp_from_ros_time(&stamp)) {
+
+                if (gnss_latest.valid_coords) {
+
+                    gnss_msg.header.stamp = stamp;
+
+                    gnss_msg.latitude  = gnss_latest.lat_deg;
+                    gnss_msg.longitude = gnss_latest.lon_deg;
+                    gnss_msg.altitude  = gnss_latest.alt_m;
+
+                    gnss_msg.status.status  = navsat_status(gnss_latest.fix_quality);
+                    gnss_msg.status.service = 1 | 2 | 4 | 8;
+
+                    gnss_quality_msg.data = gnss_latest.fix_quality;
+
+                    if (gnss_latest.valid_cov) {
+                        gnss_msg.position_covariance[0] = gnss_latest.cov_east;
+                        gnss_msg.position_covariance[1] = 0.0;
+                        gnss_msg.position_covariance[2] = 0.0;
+
+                        gnss_msg.position_covariance[3] = 0.0;
+                        gnss_msg.position_covariance[4] = gnss_latest.cov_north;
+                        gnss_msg.position_covariance[5] = 0.0;
+
+                        gnss_msg.position_covariance[6] = 0.0;
+                        gnss_msg.position_covariance[7] = 0.0;
+                        gnss_msg.position_covariance[8] = gnss_latest.cov_up;
+
+                        gnss_msg.position_covariance_type =
+                            sensor_msgs__msg__NavSatFix__COVARIANCE_TYPE_DIAGONAL_KNOWN;
+                    } else {
+                        gnss_msg.position_covariance[0] = 0.0;
+                        gnss_msg.position_covariance[1] = 0.0;
+                        gnss_msg.position_covariance[2] = 0.0;
+
+                        gnss_msg.position_covariance[3] = 0.0;
+                        gnss_msg.position_covariance[4] = 0.0;
+                        gnss_msg.position_covariance[5] = 0.0;
+
+                        gnss_msg.position_covariance[6] = 0.0;
+                        gnss_msg.position_covariance[7] = 0.0;
+                        gnss_msg.position_covariance[8] = 0.0;
+
+                        gnss_msg.position_covariance_type =
+                            sensor_msgs__msg__NavSatFix__COVARIANCE_TYPE_UNKNOWN;
+                    }
+
+                    RCCONTINUE(rcl_publish(&pub_gnss, &gnss_msg, NULL));
+                    RCCONTINUE(rcl_publish(&pub_gnss_quality, &gnss_quality_msg, NULL));
                 }
 
-                RCCONTINUE(rcl_publish(&pub_gnss, &gnss_msg, NULL));
-                RCCONTINUE(rcl_publish(&pub_gnss_quality, &gnss_quality_msg, NULL));
+                if (gnss_latest.valid_heading) {
+
+                    gnss_heading_msg.header.stamp = stamp;
+
+                    gnss_heading_msg.orientation.x = gnss_latest.qx;
+                    gnss_heading_msg.orientation.y = gnss_latest.qy;
+                    gnss_heading_msg.orientation.z = gnss_latest.qz;
+                    gnss_heading_msg.orientation.w = gnss_latest.qw;
+
+                    gnss_heading_msg.orientation_covariance[0] = 99999.0;
+                    gnss_heading_msg.orientation_covariance[1] = 0.0;
+                    gnss_heading_msg.orientation_covariance[2] = 0.0;
+
+                    gnss_heading_msg.orientation_covariance[3] = 0.0;
+                    gnss_heading_msg.orientation_covariance[4] = gnss_latest.pitch_var;
+                    gnss_heading_msg.orientation_covariance[5] = 0.0;
+
+                    gnss_heading_msg.orientation_covariance[6] = 0.0;
+                    gnss_heading_msg.orientation_covariance[7] = 0.0;
+                    gnss_heading_msg.orientation_covariance[8] = gnss_latest.yaw_var;
+
+                    gnss_heading_quality_msg.data =
+                        heading_quality(gnss_latest.heading_sol);
+
+                    RCCONTINUE(rcl_publish(&pub_gnss_heading, &gnss_heading_msg, NULL));
+                    RCCONTINUE(rcl_publish(&pub_gnss_heading_quality, &gnss_heading_quality_msg, NULL));
+                }
             }
         }
 
-        if (queue_try_get_latest(&q_gnss_heading, &gnss_heading_latest)) {
-            if (stamp_from_ros_time(&gnss_heading_msg.header.stamp)) {
-
-                gnss_heading_msg.orientation.x = gnss_heading_latest.qx;
-                gnss_heading_msg.orientation.y = gnss_heading_latest.qy;
-                gnss_heading_msg.orientation.z = gnss_heading_latest.qz;
-                gnss_heading_msg.orientation.w = gnss_heading_latest.qw;
-
-                gnss_heading_msg.orientation_covariance[0] = 99999.0;
-                gnss_heading_msg.orientation_covariance[4] = 99999.0;
-                gnss_heading_msg.orientation_covariance[8] = gnss_heading_latest.yaw_var;
-                
-                gnss_heading_quality_msg.data = gnss_heading_latest.quality;
-
-                RCCONTINUE(rcl_publish(&pub_gnss_heading, &gnss_heading_msg, NULL));
-                RCCONTINUE(rcl_publish(&pub_gnss_heading_quality, &gnss_heading_quality_msg, NULL));
-            }
-        }
-        
         if (absolute_time_diff_us(get_absolute_time(), next_ping) <= 0){
             next_ping = make_timeout_time_ms(1000);
+
+            printf("GNSS debug: bytes=%lu lines=%lu gga=%lu heading=%lu other=%lu overflow=%lu overlong=%lu max_len=%d\n",
+            gnss_bytes_rx,
+            gnss_lines_total,
+            gnss_gga_lines,
+            gnss_heading_lines,
+            gnss_other_lines,
+            gnss_overflow,
+            gnss_line_overlong,
+            gnss_max_line_len);
 
             bool ok = false;
             for (int i = 0; i < 10; i++) {
