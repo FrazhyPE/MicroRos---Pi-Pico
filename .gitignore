@@ -1,3 +1,9 @@
-build
+# Build
+build/
 
+# VS Code
+.vscode/
+**/.vscode/
+
+# Archivo que no quieres subir
 src/example.cpp
